@@ -1,5 +1,7 @@
 #include "nanovllm/hip_ops.hpp"
 
+#include <hip/amd_detail/amd_math_functions.h>
+
 #include <cmath>
 #include <cstdio>
 
@@ -82,12 +84,132 @@ __global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __r
   if (row < m && col < n) out[(int64_t)row * n + col] = acc;
 }
 
-// Warp-per-row streaming GEMV for decode (small m): lane-owns-u32 coalesced reads
-// (128B/wavefront), float4 activation loads. Requires k % 128 == 0.
-// Reduce via LDS so it is wave32/wave64 agnostic.
+// RDNA4 (gfx1201) has no signed V_DOT4_I32_I8 via inline asm; amd_mixed_dot
+// emits signed x signed correctly (validated in tools/magpie-q8/prefill.hip).
+__device__ __forceinline__ int32_t dot4_i8_signed(int32_t a, int32_t b, int32_t c) {
+  char4 va, vb;
+  *(int32_t*)&va = a;
+  *(int32_t*)&vb = b;
+  return amd_mixed_dot(va, vb, c, false);
+}
+
+// Per-row activation scale 127/max|x| for the INT8 DOT4 prefill kernel.
+__global__ void q8_row_scale_kernel(const float* __restrict__ x, float* __restrict__ rs, int m, int k) {
+  int r = blockIdx.x, t = threadIdx.x;
+  __shared__ float red[256];
+  float mx = 0.0f;
+  for (int i = t; i < k; i += 256) mx = fmaxf(mx, fabsf(x[(int64_t)r * k + i]));
+  red[t] = mx;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+    __syncthreads();
+  }
+  if (t == 0) rs[r] = red[0] > 1e-8f ? 127.0f / red[0] : 0.0f;
+}
+
+// 64x16 tile INT8 V_DOT4 matmul over split planes (w8 row-major int8, ws fp16 per 32).
+// Requires k % 16 == 0. Activations are int8-quantized per row (q8_row_scale_kernel).
+__global__ __launch_bounds__(1024) void q8_tile64_dot4_kernel(
+    const float* __restrict__ x, const uint8_t* __restrict__ w8, const uint16_t* __restrict__ ws,
+    const float* __restrict__ arow, int m, int n, int k, float* __restrict__ out) {
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  __shared__ int8_t As0[64][16], As1[64][16];
+  __shared__ int8_t Bs0[16][16], Bs1[16][16];
+  __shared__ float Sb0[16], Sb1[16];
+  __shared__ float Ascl[64];
+  __shared__ int use_buf;
+  float acc = 0.0f;
+  const int row0 = blockIdx.y * 64;
+  const int col0 = blockIdx.x * 16;
+  const int nblk = k / 32;
+  if (tx == 0) Ascl[ty] = (row0 + ty < m) ? arow[row0 + ty] : 0.0f;
+  use_buf = 0;
+  __syncthreads();
+  if (tx < 8) {
+    int t2 = ty * 8 + tx;
+    int ar = t2 >> 3, ac = (t2 & 7) * 2;
+    float2 v = {0.0f, 0.0f};
+    int row_abs = row0 + ar;
+    if (row_abs < m && ac + 1 < k)
+      v = *reinterpret_cast<const float2*>(&x[(int64_t)row_abs * k + ac]);
+    float as = Ascl[ar];
+    As0[ar][ac + 0] = (int8_t)fminf(127.0f, fmaxf(-127.0f, v.x * as));
+    As0[ar][ac + 1] = (int8_t)fminf(127.0f, fmaxf(-127.0f, v.y * as));
+  }
+  if (ty < 16) {
+    int col_global = col0 + tx;
+    int8_t val = 0;
+    if (col_global < n) val = (int8_t)w8[(int64_t)col_global * k + ty];
+    Bs0[tx][ty] = val;
+  }
+  if (ty == 0) {
+    int col_global = col0 + tx;
+    Sb0[tx] = col_global < n ? fp16_to_float_u(ws[(int64_t)col_global * nblk]) : 0.0f;
+  }
+  __syncthreads();
+  for (int kt = 0; kt < k / 16; ++kt) {
+    int cur = use_buf, nxt = cur ^ 1;
+    int8_t (*As)[16] = cur ? As1 : As0;
+    int8_t (*As_n)[16] = cur ? As0 : As1;
+    int8_t (*Bs)[16] = cur ? Bs1 : Bs0;
+    int8_t (*Bs_n)[16] = cur ? Bs0 : Bs1;
+    float* Sb = cur ? Sb1 : Sb0;
+    float* Sb_n = cur ? Sb0 : Sb1;
+    if (tx < 8) {
+      int t2 = ty * 8 + tx;
+      int ar = t2 >> 3, ac = (t2 & 7) * 2;
+      float2 v = {0.0f, 0.0f};
+      int row_abs = row0 + ar;
+      if (row_abs < m && (kt + 1) * 16 + ac + 1 < k)
+        v = *reinterpret_cast<const float2*>(&x[(int64_t)row_abs * k + (kt + 1) * 16 + ac]);
+      float as = Ascl[ar];
+      As_n[ar][ac + 0] = (int8_t)fminf(127.0f, fmaxf(-127.0f, v.x * as));
+      As_n[ar][ac + 1] = (int8_t)fminf(127.0f, fmaxf(-127.0f, v.y * as));
+    }
+    if (ty < 16) {
+      int col_global = col0 + tx;
+      int8_t val = 0;
+      if ((kt + 1) * 16 < k && col_global < n)
+        val = (int8_t)w8[(int64_t)col_global * k + (kt + 1) * 16 + ty];
+      Bs_n[tx][ty] = val;
+    }
+    if (ty == 0) {
+      int col_global = col0 + tx;
+      Sb_n[tx] = (col_global < n && (kt + 1) * 16 < k)
+                     ? fp16_to_float_u(ws[(int64_t)col_global * nblk + (kt + 1) / 2])
+                     : 0.0f;
+    }
+    int32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    int32_t a0 = *(int32_t*)&As[ty][0];
+    int32_t a1 = *(int32_t*)&As[ty][4];
+    int32_t a2 = *(int32_t*)&As[ty][8];
+    int32_t a3 = *(int32_t*)&As[ty][12];
+    int32_t b0 = *(int32_t*)&Bs[tx][0];
+    int32_t b1 = *(int32_t*)&Bs[tx][4];
+    int32_t b2 = *(int32_t*)&Bs[tx][8];
+    int32_t b3 = *(int32_t*)&Bs[tx][12];
+    c0 = dot4_i8_signed(a0, b0, c0);
+    c1 = dot4_i8_signed(a1, b1, c1);
+    c2 = dot4_i8_signed(a2, b2, c2);
+    c3 = dot4_i8_signed(a3, b3, c3);
+    acc += Sb[tx] * (float)(c0 + c1 + c2 + c3);
+    __syncthreads();
+    use_buf = nxt;
+  }
+  int row = row0 + ty;
+  int col = col0 + tx;
+  float adq = Ascl[ty] > 0.0f ? 1.0f / Ascl[ty] : 0.0f;
+  if (row < m && col < n) out[(int64_t)row * n + col] = acc * adq;
+}
+
+// Warp-per-row streaming GEMV for decode (small m): lane-owns-4-int8-activations
+// + 4-int8-weight u32, reduced via one V_DOT4_I32_I8 (rank 3 INT8 DOT). Activations
+// are int8-quantized per row (q8_row_scale_kernel, symmetric); dequant at write.
 template <int M>
 __global__ void q8_gemv_kernel(const float* __restrict__ x, const uint32_t* __restrict__ w4,
-                               const uint16_t* __restrict__ ws, int n, int k, float* __restrict__ out) {
+                               const uint16_t* __restrict__ ws, const float* __restrict__ arow,
+                               int n, int k, float* __restrict__ out) {
   const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   if (gw >= n) return;
@@ -101,14 +223,20 @@ __global__ void q8_gemv_kernel(const float* __restrict__ x, const uint32_t* __re
     const uint32_t q = row[i * 32 + lane];
     const float s = fp16_to_float_u(rows[(i << 2) + (lane >> 3)]);
     const int64_t xb = (int64_t)i * 128 + lane * 4;
-    const float q0 = s * (float)(int8_t)(q & 0xff);
-    const float q1 = s * (float)(int8_t)((q >> 8) & 0xff);
-    const float q2 = s * (float)(int8_t)((q >> 16) & 0xff);
-    const float q3 = s * (float)(int8_t)(q >> 24);
+    const int32_t qi = (int32_t)q;
 #pragma unroll
     for (int r = 0; r < M; ++r) {
-      const float4 xv = *reinterpret_cast<const float4*>(&x[(int64_t)r * k + xb]);
-      acc[r] = fmaf(q0, xv.x, fmaf(q1, xv.y, fmaf(q2, xv.z, fmaf(q3, xv.w, acc[r]))));
+      float as = arow[r];
+      if (as > 0.0f) {
+        const float4 xv = *reinterpret_cast<const float4*>(&x[(int64_t)r * k + xb]);
+        int8_t xa[4];
+        xa[0] = (int8_t)fminf(127.0f, fmaxf(-127.0f, xv.x * as));
+        xa[1] = (int8_t)fminf(127.0f, fmaxf(-127.0f, xv.y * as));
+        xa[2] = (int8_t)fminf(127.0f, fmaxf(-127.0f, xv.z * as));
+        xa[3] = (int8_t)fminf(127.0f, fmaxf(-127.0f, xv.w * as));
+        int32_t xq = *reinterpret_cast<const int32_t*>(xa);
+        acc[r] += s * (float)dot4_i8_signed(xq, qi, 0);
+      }
     }
   }
   __shared__ float sred[8][M][32];
@@ -121,7 +249,8 @@ __global__ void q8_gemv_kernel(const float* __restrict__ x, const uint32_t* __re
     for (int r = 0; r < M; ++r) {
       float t = 0.0f;
       for (int l = 0; l < 32; ++l) t += sred[wp][r][l];
-      out[(int64_t)r * n + gw] = t;
+      float as = arow[r];
+      out[(int64_t)r * n + gw] = as > 0.0f ? t * (1.0f / as) : 0.0f;
     }
   }
 }
@@ -367,9 +496,17 @@ void hip_matmul_u16(const float* x, const uint16_t* w, int m, int n, int k, floa
 void hip_matmul_q8(const float* x, const uint8_t* w8, const uint16_t* ws, int m, int n, int k, float* out) {
   if (m <= 0 || n <= 0 || k <= 0) return;
   if (m <= 8 && (k & 127) == 0) {
+    static float* arow = nullptr;
+    static int arow_cap = 0;
+    if (m > arow_cap) {  // ponytail: grow-only scratch; engine is single-threaded
+      if (arow) HIP_CHECK(hipFree(arow));
+      HIP_CHECK(hipMalloc(&arow, (size_t)m * sizeof(float)));
+      arow_cap = m;
+    }
+    q8_row_scale_kernel<<<m, 256>>>(x, arow, m, k);
     const int threads = 256;
     dim3 blocks((n * 32 + threads - 1) / threads);
-#define NANO_Q8_GEMV(MM) q8_gemv_kernel<MM><<<blocks, threads>>>(x, reinterpret_cast<const uint32_t*>(w8), ws, n, k, out)
+#define NANO_Q8_GEMV(MM) q8_gemv_kernel<MM><<<blocks, threads>>>(x, reinterpret_cast<const uint32_t*>(w8), ws, arow, n, k, out)
     switch (m) {
       case 1: NANO_Q8_GEMV(1); break;
       case 2: NANO_Q8_GEMV(2); break;
@@ -381,6 +518,21 @@ void hip_matmul_q8(const float* x, const uint8_t* w8, const uint16_t* ws, int m,
       default: NANO_Q8_GEMV(8); break;
     }
 #undef NANO_Q8_GEMV
+    HIP_CHECK(hipGetLastError());
+    return;
+  }
+  if ((k & 15) == 0 && k >= 32) {
+    static float* arow = nullptr;
+    static int arow_cap = 0;
+    if (m > arow_cap) {  // ponytail: grow-only scratch; engine is single-threaded
+      if (arow) HIP_CHECK(hipFree(arow));
+      HIP_CHECK(hipMalloc(&arow, (size_t)m * sizeof(float)));
+      arow_cap = m;
+    }
+    q8_row_scale_kernel<<<m, 256>>>(x, arow, m, k);
+    dim3 t64(16, 64);
+    dim3 b64((n + 15) / 16, (m + 63) / 64);
+    q8_tile64_dot4_kernel<<<b64, t64>>>(x, w8, ws, arow, m, n, k, out);
     HIP_CHECK(hipGetLastError());
     return;
   }

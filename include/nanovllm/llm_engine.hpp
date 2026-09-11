@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "config.hpp"
@@ -23,13 +25,15 @@ class LLMEngine {
   void add_request(const std::vector<int>& prompt, const SamplingParams& sp);
   void add_chat_request(const std::string& user_prompt, const SamplingParams& sp);
   bool is_finished() const;
-  std::pair<std::vector<std::pair<int, std::vector<int>>>, int> step();
+  std::tuple<std::vector<std::pair<int, std::vector<int>>>, int, std::vector<std::pair<int, int>>> step();
   std::vector<GenerateOutput> generate(const std::vector<std::string>& prompts, const SamplingParams& sp);
   std::vector<GenerateOutput> generate(const std::vector<std::string>& prompts, const std::vector<SamplingParams>& sps);
   std::vector<GenerateOutput> generate_chat(const std::vector<std::string>& prompts, const std::vector<SamplingParams>& sps);
   std::vector<GenerateOutput> generate(const std::vector<std::vector<int>>& prompts, const std::vector<SamplingParams>& sps);
   int vocab_size() const { return config_.hf.vocab_size; }
+  int eos_token() const { return config_.eos; }
   std::vector<int> encode_text(const std::string& text) const;
+  std::string decode_token(int id) const;
 
  private:
   Config config_;
