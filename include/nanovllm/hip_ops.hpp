@@ -7,7 +7,7 @@
 
 void hip_matmul(const float* x, const float* w, int m, int n, int k, float* out);
 void hip_matmul_u16(const float* x, const uint16_t* w, int m, int n, int k, float* out, bool w_bf16);
-void hip_matmul_q8(const float* x, const uint8_t* w, int m, int n, int k, float* out);
+void hip_matmul_q8(const float* x, const uint8_t* w8, const uint16_t* ws, int m, int n, int k, float* out);
 void hip_add_bias_inplace(float* x, const float* bias, int rows, int cols);
 
 void hip_rms_norm(const float* x, const float* weight, float* out, int rows, int hidden, float eps);
@@ -28,7 +28,7 @@ void hip_paged_attention(const float* q, float* out, const float* k_cache, const
 
 void hip_embedding(const int64_t* ids, const float* table, int tokens, int hidden, float* out);
 void hip_embedding_u16(const int64_t* ids, const uint16_t* table, int tokens, int hidden, float* out, bool table_bf16);
-void hip_embedding_q8(const int64_t* ids, const uint8_t* table, int tokens, int hidden, float* out);
+void hip_embedding_q8(const int64_t* ids, const uint8_t* w8, const uint16_t* ws, int tokens, int hidden, float* out);
 void hip_gather_rows(const float* rows, const int32_t* indices, int rows_count, int cols, int out_rows, float* out);
 void hip_copy_to_host(const float* dev, std::vector<float>& out, size_t n);
 void hip_copy_from_host(const std::vector<float>& host, float* dev);

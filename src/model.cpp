@@ -111,10 +111,13 @@ static bool load_optional(WeightLoader& loader, const std::string& name, std::ve
 }
 
 // Loads a big matmul/embedding weight, keeping its on-disk encoding (F16/BF16 or Q8_0).
+static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m, bool required);
+static void upload_q8_split(Matrix& m, const std::vector<uint8_t>& fused);
+
 static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m, bool required) {
   std::vector<uint8_t> q8;
   if (loader.load_q8(name, q8)) {
-    m.q8.assign(q8);
+    upload_q8_split(m, q8);
     m.f16.free();
     m.is_q8 = true;
     return;
@@ -124,6 +127,7 @@ static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m
   if (loader.load_u16(name, u, bf16)) {
     m.f16.assign(u);
     m.q8.free();
+    m.qsc.free();
     m.is_q8 = false;
     m.bf16 = bf16;
     return;
@@ -182,7 +186,19 @@ static void concat_rows_q8(std::vector<uint8_t>& dst, const std::vector<uint8_t>
 
 static void upload(DevVec<float>& dst, const std::vector<float>& src) { dst.assign(src); }
 static void upload_u16(DevVec<uint16_t>& dst, const std::vector<uint16_t>& src) { dst.assign(src); }
-static void upload_q8(DevVec<uint8_t>& dst, const std::vector<uint8_t>& src) { dst.assign(src); }
+
+// Split fused 34-byte Q8_0 blocks into int8 + fp16-scale planes, upload both.
+static void upload_q8_split(Matrix& m, const std::vector<uint8_t>& fused) {
+  size_t nblk = fused.size() / 34;
+  std::vector<uint8_t> w8(nblk * 32);
+  std::vector<uint16_t> ws(nblk);
+  for (size_t b = 0; b < nblk; ++b) {
+    memcpy(&ws[b], &fused[b * 34], 2);
+    memcpy(&w8[b * 32], &fused[b * 34 + 2], 32);
+  }
+  m.q8.assign(w8);
+  m.qsc.assign(ws);
+}
 
 Qwen3Model::Qwen3Model(const Config& config) : config_(config) {
   config_.validate();
@@ -234,14 +250,14 @@ void Qwen3Model::load_weights() {
           throw std::runtime_error("mixed Q8/non-Q8 q/k/v weights are unsupported");
         std::vector<uint8_t> fused;
         concat_rows_q8(fused, q_q8, k_q8, v_q8);
-        upload_q8(lw.qkv.q8, fused);
+        upload_q8_split(lw.qkv, fused);
         lw.qkv.f16.free();
         lw.qkv.is_q8 = true;
       } else {
         std::vector<uint16_t> fused;
         concat_rows_u(fused, q_u, k_u, v_u);
         upload_u16(lw.qkv.f16, fused);
-        lw.qkv.q8.free();
+        lw.qkv.q8.free(); lw.qkv.qsc.free();
         lw.qkv.is_q8 = false;
         lw.qkv.bf16 = q_bf16 && k_bf16 && v_bf16;
       }
@@ -274,7 +290,7 @@ void Qwen3Model::load_weights() {
         fused.reserve(g_q8.size() + u_q8.size());
         fused.insert(fused.end(), g_q8.begin(), g_q8.end());
         fused.insert(fused.end(), u_q8.begin(), u_q8.end());
-        upload_q8(lw.gate_up.q8, fused);
+        upload_q8_split(lw.gate_up, fused);
         lw.gate_up.f16.free();
         lw.gate_up.is_q8 = true;
       } else {
@@ -283,7 +299,7 @@ void Qwen3Model::load_weights() {
         fused.insert(fused.end(), g_u.begin(), g_u.end());
         fused.insert(fused.end(), u_u.begin(), u_u.end());
         upload_u16(lw.gate_up.f16, fused);
-        lw.gate_up.q8.free();
+        lw.gate_up.q8.free(); lw.gate_up.qsc.free();
         lw.gate_up.is_q8 = false;
         lw.gate_up.bf16 = g_bf16 && u_bf16;
       }
@@ -351,21 +367,21 @@ int Qwen3Model::estimate_kv_cache_blocks() const {
 
 static void matmul_dispatch(const float* x, const Matrix& w, int m, int n, int k, float* out) {
   if (w.is_q8)
-    hip_matmul_q8(x, w.q8.d, m, n, k, out);
+    hip_matmul_q8(x, w.q8.d, w.qsc.d, m, n, k, out);
   else
     hip_matmul_u16(x, w.f16.d, m, n, k, out, w.bf16);
 }
 
 static void matmul_row_dispatch(const float* x, const Matrix& w, size_t elem, int m, int n, int k, float* out) {
   if (w.is_q8)
-    hip_matmul_q8(x, w.q8.d + (elem / 32) * 34, m, n, k, out);
+    hip_matmul_q8(x, w.q8.d + elem, w.qsc.d + elem / 32, m, n, k, out);
   else
     hip_matmul_u16(x, w.f16.d + elem, m, n, k, out, w.bf16);
 }
 
 static void embedding_dispatch(const int64_t* ids, const Matrix& w, int tokens, int hidden, float* out) {
   if (w.is_q8)
-    hip_embedding_q8(ids, w.q8.d, tokens, hidden, out);
+    hip_embedding_q8(ids, w.q8.d, w.qsc.d, tokens, hidden, out);
   else
     hip_embedding_u16(ids, w.f16.d, tokens, hidden, out, w.bf16);
 }

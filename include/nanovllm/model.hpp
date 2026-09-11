@@ -16,7 +16,8 @@
 //  - q8:   DevVec<uint8_t>  Q8_0 blocks (34 bytes per 32 elements) -- in-kernel dequant
 struct Matrix {
   DevVec<uint16_t> f16;
-  DevVec<uint8_t> q8;
+  DevVec<uint8_t> q8;    // int8 weight plane (Q8_0, rows contiguous)
+  DevVec<uint16_t> qsc;  // fp16 block scales plane, one per 32 elements
   bool bf16 = false;
   bool is_q8 = false;
 };

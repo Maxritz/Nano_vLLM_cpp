@@ -58,18 +58,9 @@ __global__ void matmul_kernel(const float* __restrict__ x, const TW* __restrict_
   if (row < m && col < n) out[(int64_t)row * n + col] = acc;
 }
 
-__device__ __forceinline__ float q8_load(const uint8_t* __restrict__ w, int64_t idx) {
-  int64_t block = idx >> 5;        // 32 elements per block
-  int sub = (int)(idx & 31);
-  const uint8_t* b = w + block * 34;
-  uint16_t d;
-  __builtin_memcpy(&d, b, 2);
-  float scale = fp16_to_float_u(d);
-  return scale * (float)((int8_t)b[2 + sub]);
-}
-
-__global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w, int m, int n, int k,
-                                 float* __restrict__ out) {
+// Q8_0 stored as split planes: int8 weights (row-contiguous) + fp16 scales.
+__global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w8,
+                                 const uint16_t* __restrict__ ws, int m, int n, int k, float* __restrict__ out) {
   int tx = threadIdx.x, ty = threadIdx.y;
   int row = blockIdx.y * TILE + ty;
   int col = blockIdx.x * TILE + tx;
@@ -82,7 +73,8 @@ __global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __r
     As[ty][tx] = (row_abs < m && ak < k) ? x[(int64_t)row_abs * k + ak] : 0.0f;
     int br = blockIdx.x * TILE + tx;
     int bk = kt * TILE + ty;
-    Bs[ty][tx] = (br < n && bk < k) ? q8_load(w, (int64_t)br * k + bk) : 0.0f;
+    int64_t idx = (int64_t)br * k + bk;
+    Bs[ty][tx] = (br < n && bk < k) ? fp16_to_float_u(ws[idx >> 5]) * (float)(int8_t)w8[idx] : 0.0f;
     __syncthreads();
     for (int a = 0; a < TILE; ++a) acc += As[ty][a] * Bs[a][tx];
     __syncthreads();
@@ -90,27 +82,34 @@ __global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __r
   if (row < m && col < n) out[(int64_t)row * n + col] = acc;
 }
 
-// Warp-per-row streaming GEMV for decode (small m): fully coalesced Q8_0 block reads.
-// k must be a multiple of 32. Reduce via LDS so it is wave32/wave64 agnostic.
+// Warp-per-row streaming GEMV for decode (small m): lane-owns-u32 coalesced reads
+// (128B/wavefront), float4 activation loads. Requires k % 128 == 0.
+// Reduce via LDS so it is wave32/wave64 agnostic.
 template <int M>
-__global__ void q8_gemv_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w, int n, int k,
-                               float* __restrict__ out) {
+__global__ void q8_gemv_kernel(const float* __restrict__ x, const uint32_t* __restrict__ w4,
+                               const uint16_t* __restrict__ ws, int n, int k, float* __restrict__ out) {
   const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   if (gw >= n) return;
-  const uint8_t* row = w + (int64_t)gw * ((k >> 5) * 34);
-  const int nblk = k >> 5;
+  const uint32_t* row = w4 + (int64_t)gw * (k >> 2);
+  const uint16_t* rows = ws + (int64_t)gw * (k >> 5);
+  const int nit = k >> 7;
   float acc[M];
 #pragma unroll
   for (int r = 0; r < M; ++r) acc[r] = 0.0f;
-  for (int b = 0; b < nblk; ++b) {
-    const uint8_t* blk = row + (int64_t)b * 34;
-    uint16_t ds;
-    __builtin_memcpy(&ds, blk, 2);
-    const float wv = fp16_to_float_u(ds) * (float)(int8_t)blk[2 + lane];
+  for (int i = 0; i < nit; ++i) {
+    const uint32_t q = row[i * 32 + lane];
+    const float s = fp16_to_float_u(rows[(i << 2) + (lane >> 3)]);
+    const int64_t xb = (int64_t)i * 128 + lane * 4;
+    const float q0 = s * (float)(int8_t)(q & 0xff);
+    const float q1 = s * (float)(int8_t)((q >> 8) & 0xff);
+    const float q2 = s * (float)(int8_t)((q >> 16) & 0xff);
+    const float q3 = s * (float)(int8_t)(q >> 24);
 #pragma unroll
-    for (int r = 0; r < M; ++r)
-      acc[r] = fmaf(wv, x[(int64_t)r * k + (b << 5) + lane], acc[r]);
+    for (int r = 0; r < M; ++r) {
+      const float4 xv = *reinterpret_cast<const float4*>(&x[(int64_t)r * k + xb]);
+      acc[r] = fmaf(q0, xv.x, fmaf(q1, xv.y, fmaf(q2, xv.z, fmaf(q3, xv.w, acc[r]))));
+    }
   }
   __shared__ float sred[8][M][32];
   const int wp = threadIdx.x >> 5;
@@ -120,9 +119,9 @@ __global__ void q8_gemv_kernel(const float* __restrict__ x, const uint8_t* __res
   if (lane == 0) {
 #pragma unroll
     for (int r = 0; r < M; ++r) {
-      float s = 0.0f;
-      for (int l = 0; l < 32; ++l) s += sred[wp][r][l];
-      out[(int64_t)r * n + gw] = s;
+      float t = 0.0f;
+      for (int l = 0; l < 32; ++l) t += sred[wp][r][l];
+      out[(int64_t)r * n + gw] = t;
     }
   }
 }
@@ -326,14 +325,15 @@ __global__ void embedding_kernel(const int64_t* __restrict__ ids, const TW* __re
   out[(int64_t)token * hidden + col] = wt_load(v, w_bf16);
 }
 
-__global__ void embedding_q8_kernel(const int64_t* __restrict__ ids, const uint8_t* __restrict__ table, int hidden,
-                                    int total, float* __restrict__ out) {
+__global__ void embedding_q8_kernel(const int64_t* __restrict__ ids, const uint8_t* __restrict__ w8,
+                                    const uint16_t* __restrict__ ws, int hidden, int total, float* __restrict__ out) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   int token = idx / hidden;
   int col = idx % hidden;
   int64_t id = ids[token];
-  out[(int64_t)token * hidden + col] = q8_load(table, (int64_t)id * hidden + col);
+  int64_t e = id * hidden + col;
+  out[(int64_t)token * hidden + col] = fp16_to_float_u(ws[e >> 5]) * (float)(int8_t)w8[e];
 }
 
 __global__ void gather_rows_kernel(const float* __restrict__ rows, const int32_t* __restrict__ indices, int cols,
@@ -364,12 +364,12 @@ void hip_matmul_u16(const float* x, const uint16_t* w, int m, int n, int k, floa
   HIP_CHECK(hipGetLastError());
 }
 
-void hip_matmul_q8(const float* x, const uint8_t* w, int m, int n, int k, float* out) {
+void hip_matmul_q8(const float* x, const uint8_t* w8, const uint16_t* ws, int m, int n, int k, float* out) {
   if (m <= 0 || n <= 0 || k <= 0) return;
-  if (m <= 8 && (k & 31) == 0) {
+  if (m <= 8 && (k & 127) == 0) {
     const int threads = 256;
     dim3 blocks((n * 32 + threads - 1) / threads);
-#define NANO_Q8_GEMV(MM) q8_gemv_kernel<MM><<<blocks, threads>>>(x, w, n, k, out)
+#define NANO_Q8_GEMV(MM) q8_gemv_kernel<MM><<<blocks, threads>>>(x, reinterpret_cast<const uint32_t*>(w8), ws, n, k, out)
     switch (m) {
       case 1: NANO_Q8_GEMV(1); break;
       case 2: NANO_Q8_GEMV(2); break;
@@ -386,7 +386,7 @@ void hip_matmul_q8(const float* x, const uint8_t* w, int m, int n, int k, float*
   }
   dim3 blocks((n + TILE - 1) / TILE, (m + TILE - 1) / TILE);
   dim3 threads(TILE, TILE);
-  matmul_q8_kernel<<<blocks, threads>>>(x, w, m, n, k, out);
+  matmul_q8_kernel<<<blocks, threads>>>(x, w8, ws, m, n, k, out);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -464,11 +464,11 @@ void hip_embedding_u16(const int64_t* ids, const uint16_t* table, int tokens, in
   HIP_CHECK(hipGetLastError());
 }
 
-void hip_embedding_q8(const int64_t* ids, const uint8_t* table, int tokens, int hidden, float* out) {
+void hip_embedding_q8(const int64_t* ids, const uint8_t* w8, const uint16_t* ws, int tokens, int hidden, float* out) {
   if (tokens <= 0 || hidden <= 0) return;
   int total = tokens * hidden;
   int block = 256;
-  embedding_q8_kernel<<<(total + block - 1) / block, block>>>(ids, table, hidden, total, out);
+  embedding_q8_kernel<<<(total + block - 1) / block, block>>>(ids, w8, ws, hidden, total, out);
   HIP_CHECK(hipGetLastError());
 }
 
