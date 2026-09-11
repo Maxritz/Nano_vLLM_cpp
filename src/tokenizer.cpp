@@ -429,11 +429,7 @@ std::string Tokenizer::decode_tokens(const std::vector<int>& ids) const {
     if (id < 0 || id >= static_cast<int>(id_to_piece_.size())) continue;
     const std::string& piece = id_to_piece_[id];
     auto special = special_id_.find(piece);
-    if (special != special_id_.end()) {
-      out += piece;
-    } else {
-      out += byte_level_to_bytes(piece);
-    }
+    if (special == special_id_.end()) out += byte_level_to_bytes(piece);
   }
   return out;
 }

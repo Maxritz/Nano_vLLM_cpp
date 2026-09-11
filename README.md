@@ -4,7 +4,7 @@ A pure C++/HIP rewrite of the Python nano-vLLM repository. No PyTorch, no Triton
 
 ## Supported GPUs
 
-- RDNA2: RX 6700 XT (`gfx1030`, loads on `gfx1031`)
+- RDNA2: RX 6700 XT (`gfx1031`)
 - RDNA4: RX 9070 XT (`gfx1201`)
 
 ## Build

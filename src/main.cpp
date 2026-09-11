@@ -6,6 +6,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include "nanovllm/llm_engine.hpp"
 
 static void usage(const char* prog) {
@@ -28,6 +34,9 @@ static std::vector<int> parse_ids(const std::string& s) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  SetConsoleOutputCP(CP_UTF8);
+#endif
   try {
     if (argc < 2) {
       usage(argv[0]);
@@ -111,10 +120,16 @@ int main(int argc, char** argv) {
       outputs = engine.generate(std::vector<std::string>{prompt.empty() ? "Hello" : prompt}, sp);
     }
 
-    for (auto& out : outputs) {
-      std::printf("token_ids:");
-      for (int id : out.token_ids) std::printf(" %d", id);
-      std::printf("\ntext: %s\n", out.text.c_str());
+    if (!bench) {
+      const bool dbg = getenv("NANO_DEBUG") != nullptr;
+      for (auto& out : outputs) {
+        if (dbg) {
+          std::fprintf(stderr, "token_ids:");
+          for (int id : out.token_ids) std::fprintf(stderr, " %d", id);
+          std::fprintf(stderr, "\n");
+        }
+        std::printf("%s\n", out.text.c_str());
+      }
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "Error: %s\n", e.what());
