@@ -90,6 +90,43 @@ __global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __r
   if (row < m && col < n) out[(int64_t)row * n + col] = acc;
 }
 
+// Warp-per-row streaming GEMV for decode (small m): fully coalesced Q8_0 block reads.
+// k must be a multiple of 32. Reduce via LDS so it is wave32/wave64 agnostic.
+template <int M>
+__global__ void q8_gemv_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w, int n, int k,
+                               float* __restrict__ out) {
+  const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (gw >= n) return;
+  const uint8_t* row = w + (int64_t)gw * ((k >> 5) * 34);
+  const int nblk = k >> 5;
+  float acc[M];
+#pragma unroll
+  for (int r = 0; r < M; ++r) acc[r] = 0.0f;
+  for (int b = 0; b < nblk; ++b) {
+    const uint8_t* blk = row + (int64_t)b * 34;
+    uint16_t ds;
+    __builtin_memcpy(&ds, blk, 2);
+    const float wv = fp16_to_float_u(ds) * (float)(int8_t)blk[2 + lane];
+#pragma unroll
+    for (int r = 0; r < M; ++r)
+      acc[r] = fmaf(wv, x[(int64_t)r * k + (b << 5) + lane], acc[r]);
+  }
+  __shared__ float sred[8][M][32];
+  const int wp = threadIdx.x >> 5;
+#pragma unroll
+  for (int r = 0; r < M; ++r) sred[wp][r][lane] = acc[r];
+  __syncthreads();
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      float s = 0.0f;
+      for (int l = 0; l < 32; ++l) s += sred[wp][r][l];
+      out[(int64_t)r * n + gw] = s;
+    }
+  }
+}
+
 __global__ void add_bias_kernel(float* __restrict__ x, const float* __restrict__ bias, int rows, int cols) {
   int row = blockIdx.x;
   int t = threadIdx.x;
@@ -329,6 +366,24 @@ void hip_matmul_u16(const float* x, const uint16_t* w, int m, int n, int k, floa
 
 void hip_matmul_q8(const float* x, const uint8_t* w, int m, int n, int k, float* out) {
   if (m <= 0 || n <= 0 || k <= 0) return;
+  if (m <= 8 && (k & 31) == 0) {
+    const int threads = 256;
+    dim3 blocks((n * 32 + threads - 1) / threads);
+#define NANO_Q8_GEMV(MM) q8_gemv_kernel<MM><<<blocks, threads>>>(x, w, n, k, out)
+    switch (m) {
+      case 1: NANO_Q8_GEMV(1); break;
+      case 2: NANO_Q8_GEMV(2); break;
+      case 3: NANO_Q8_GEMV(3); break;
+      case 4: NANO_Q8_GEMV(4); break;
+      case 5: NANO_Q8_GEMV(5); break;
+      case 6: NANO_Q8_GEMV(6); break;
+      case 7: NANO_Q8_GEMV(7); break;
+      default: NANO_Q8_GEMV(8); break;
+    }
+#undef NANO_Q8_GEMV
+    HIP_CHECK(hipGetLastError());
+    return;
+  }
   dim3 blocks((n + TILE - 1) / TILE, (m + TILE - 1) / TILE);
   dim3 threads(TILE, TILE);
   matmul_q8_kernel<<<blocks, threads>>>(x, w, m, n, k, out);
