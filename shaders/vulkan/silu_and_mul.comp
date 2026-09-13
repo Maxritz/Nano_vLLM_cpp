@@ -1,0 +1,18 @@
+// Mirrors hip_ops.hip silu_and_mul_kernel. Bit-exact.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int rows; int intermediate; } pc;
+layout(std430, binding = 0) buffer BGUP { float gup[]; }; // [rows * 2 * intermediate] = [gate | up]
+layout(std430, binding = 1) buffer BY { float y[]; };
+void main() {
+    uint idx = uint(gl_WorkGroupID.x) * 256 + gl_LocalInvocationIndex;
+    uint total = uint(pc.rows * pc.intermediate);
+    if (idx >= total) return;
+    uint r = idx / uint(pc.intermediate);
+    uint c = idx % uint(pc.intermediate);
+    uint twoi = uint(pc.intermediate * 2);
+    float gate = gup[r * twoi + c];
+    float up = gup[r * twoi + uint(pc.intermediate) + c];
+    y[r * uint(pc.intermediate) + c] = gate / (1.0 + exp(-gate)) * up;
+}

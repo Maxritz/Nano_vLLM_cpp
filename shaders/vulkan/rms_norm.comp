@@ -1,0 +1,19 @@
+// Mirrors hip_ops.hip rms_norm_kernel (row-block reduce, rsqrtf). Bit-exact.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int rows; int hidden; float eps; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BW { float w[]; };
+layout(std430, binding = 2) buffer BY { float y[]; };
+shared float red[256];
+void main() {
+    uint r = gl_WorkGroupID.x, t = gl_LocalInvocationIndex;
+    float sum = 0.0;
+    for (int i = int(t); i < pc.hidden; i += 256) { float v = x[r*uint(pc.hidden)+uint(i)]; sum += v*v; }
+    red[t] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) { if (t < s) red[t] += red[t+s]; barrier(); }
+    float inv = inversesqrt(red[0] / float(pc.hidden) + pc.eps);
+    for (int i = int(t); i < pc.hidden; i += 256) y[r*uint(pc.hidden)+uint(i)] = x[r*uint(pc.hidden)+uint(i)] * inv * w[i];
+}

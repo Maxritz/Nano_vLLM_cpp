@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <cstdio>
 
 #include "nanovllm/common.hpp"
 #include "nanovllm/gguf.hpp"
@@ -20,7 +22,18 @@ class WeightLoader {
   bool load_float(const std::string& st_name, std::vector<float>& out) const;
   bool load_u16(const std::string& st_name, std::vector<uint16_t>& out, bool& bf16) const;
   bool load_q8(const std::string& st_name, std::vector<uint8_t>& out) const;
+  bool load_qk(const std::string& st_name, int kind, size_t n_elements, std::vector<uint8_t>& out) const;
   bool gguf_mode() const { return gg_; }
+  // MoE weights would otherwise be silently ignored (garbage output). Fail loud.
+  bool has_moe() const {
+    auto names = st_ ? st_loader_.names() : gg_loader_.names();
+    for (auto& n : names)
+      if (n.find("exps") != std::string::npos || n.find(".experts.") != std::string::npos ||
+          n.find("gate_inp") != std::string::npos || n.find("shared_expert") != std::string::npos ||
+          n.find("moe") != std::string::npos)
+        return true;
+    return false;
+  }
 
  private:
   static std::string map(const std::string& st_name);
@@ -106,21 +119,43 @@ bool WeightLoader::load_q8(const std::string& st_name, std::vector<uint8_t>& out
   return gg_ && gg_loader_.load_q8_0(map(st_name), out);
 }
 
+bool WeightLoader::load_qk(const std::string& st_name, int kind, size_t n_elements,
+                            std::vector<uint8_t>& out) const {
+  return gg_ && gg_loader_.load_qk(map(st_name), kind, n_elements, out);
+}
+
 static bool load_optional(WeightLoader& loader, const std::string& name, std::vector<float>& out) {
   return loader.load_float(name, out);
 }
 
-// Loads a big matmul/embedding weight, keeping its on-disk encoding (F16/BF16 or Q8_0).
-static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m, bool required);
+// Loads a big matmul/embedding weight, keeping its on-disk encoding (F16/BF16,
+// Q8_0, or raw K-quant super-blocks). n_elements must match the tensor.
+static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m, bool required,
+                        size_t n_elements);
 static void upload_q8_split(Matrix& m, const std::vector<uint8_t>& fused);
 
-static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m, bool required) {
+static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m, bool required,
+                        size_t n_elements) {
   std::vector<uint8_t> q8;
   if (loader.load_q8(name, q8)) {
     upload_q8_split(m, q8);
     m.f16.free();
+    m.qk.free();
+    m.qk_segs.clear();
     m.is_q8 = true;
     return;
+  }
+  for (int kind : {12, 13, 14}) {
+    std::vector<uint8_t> qk;
+    if (loader.load_qk(name, kind, n_elements, qk)) {
+      m.qk.assign(qk);
+      m.qk_segs = {{kind, 0, 0}};
+      m.f16.free();
+      m.q8.free();
+      m.qsc.free();
+      m.is_q8 = false;
+      return;
+    }
   }
   std::vector<uint16_t> u;
   bool bf16 = false;
@@ -128,6 +163,8 @@ static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m
     m.f16.assign(u);
     m.q8.free();
     m.qsc.free();
+    m.qk.free();
+    m.qk_segs.clear();
     m.is_q8 = false;
     m.bf16 = bf16;
     return;
@@ -136,16 +173,25 @@ static void load_matrix(WeightLoader& loader, const std::string& name, Matrix& m
 }
 
 // Loads a tensor as host bytes for fuse-then-upload (q/k/v, gate/up). Exactly one
-// of {u16, q8} is filled; the other stays empty.
+// of {u16, q8, qk} is filled; the others stay empty. kind carries the K-quant id.
 static void load_matrix_host(WeightLoader& loader, const std::string& name, std::vector<uint16_t>& u16,
-                             bool& bf16, std::vector<uint8_t>& q8, bool& is_q8, bool required) {
+                             bool& bf16, std::vector<uint8_t>& q8, bool& is_q8, std::vector<uint8_t>& qk,
+                             int& qk_kind, size_t n_elements, bool required) {
   u16.clear();
   q8.clear();
+  qk.clear();
   bf16 = false;
   is_q8 = false;
+  qk_kind = 0;
   if (loader.load_q8(name, q8)) {
     is_q8 = true;
     return;
+  }
+  for (int kind : {12, 13, 14}) {
+    if (loader.load_qk(name, kind, n_elements, qk)) {
+      qk_kind = kind;
+      return;
+    }
   }
   if (loader.load_u16(name, u16, bf16)) {
     is_q8 = false;
@@ -222,13 +268,14 @@ Qwen3Model::~Qwen3Model() = default;
 void Qwen3Model::load_weights() {
   WeightLoader loader;
   loader.load_model_dir(config_.model);
+  if (loader.has_moe()) throw std::runtime_error("MoE models are not supported by this dense engine");
   if (!loader.contains("model.embed_tokens.weight")) throw std::runtime_error("model.embed_tokens.weight not found");
 
   auto& hf = config_.hf;
   int hidden = hf.hidden_size;
   int inter = hf.intermediate_size;
 
-  load_matrix(loader, "model.embed_tokens.weight", embed_, true);
+  load_matrix(loader, "model.embed_tokens.weight", embed_, true, size_t(hf.vocab_size) * hidden);
 
   for (int layer = 0; layer < hf.num_hidden_layers; ++layer) {
     std::string p = "model.layers." + std::to_string(layer);
@@ -236,15 +283,20 @@ void Qwen3Model::load_weights() {
 
     // qkv: prefer fused, else separate q/k/v (works for both safetensors and GGUF names).
     if (loader.contains(p + ".self_attn.qkv_proj.weight")) {
-      load_matrix(loader, p + ".self_attn.qkv_proj.weight", lw.qkv, true);
+      load_matrix(loader, p + ".self_attn.qkv_proj.weight", lw.qkv, true, size_t(qkv_size_) * hidden);
     } else {
       std::vector<uint16_t> q_u, k_u, v_u;
       bool q_bf16 = false, k_bf16 = false, v_bf16 = false;
       std::vector<uint8_t> q_q8, k_q8, v_q8;
       bool q_is_q8 = false, k_is_q8 = false, v_is_q8 = false;
-      load_matrix_host(loader, p + ".self_attn.q_proj.weight", q_u, q_bf16, q_q8, q_is_q8, true);
-      load_matrix_host(loader, p + ".self_attn.k_proj.weight", k_u, k_bf16, k_q8, k_is_q8, true);
-      load_matrix_host(loader, p + ".self_attn.v_proj.weight", v_u, v_bf16, v_q8, v_is_q8, true);
+      std::vector<uint8_t> q_qk, k_qk, v_qk;
+      int q_kind = 0, k_kind = 0, v_kind = 0;
+      load_matrix_host(loader, p + ".self_attn.q_proj.weight", q_u, q_bf16, q_q8, q_is_q8, q_qk, q_kind,
+                       size_t(q_size_) * hidden, true);
+      load_matrix_host(loader, p + ".self_attn.k_proj.weight", k_u, k_bf16, k_q8, k_is_q8, k_qk, k_kind,
+                       size_t(kv_size_) * hidden, true);
+      load_matrix_host(loader, p + ".self_attn.v_proj.weight", v_u, v_bf16, v_q8, v_is_q8, v_qk, v_kind,
+                       size_t(kv_size_) * hidden, true);
       if (q_is_q8 || k_is_q8 || v_is_q8) {
         if (!(q_is_q8 && k_is_q8 && v_is_q8))
           throw std::runtime_error("mixed Q8/non-Q8 q/k/v weights are unsupported");
@@ -252,12 +304,33 @@ void Qwen3Model::load_weights() {
         concat_rows_q8(fused, q_q8, k_q8, v_q8);
         upload_q8_split(lw.qkv, fused);
         lw.qkv.f16.free();
+        lw.qkv.qk.free();
+        lw.qkv.qk_segs.clear();
         lw.qkv.is_q8 = true;
+      } else if (q_kind || k_kind || v_kind) {
+        if (!(q_kind && k_kind && v_kind))
+          throw std::runtime_error("mixed K-quant/non-K-quant q/k/v weights are unsupported");
+        size_t qe = size_t(q_size_) * hidden, ke = size_t(kv_size_) * hidden;
+        if (qe % 256 || ke % 256)
+          throw std::runtime_error("K-quant q/k/v split is not on a super-block boundary");
+        size_t qb = qe / 256 * GGUFLoader::qk_block_bytes(q_kind);
+        size_t kb = ke / 256 * GGUFLoader::qk_block_bytes(k_kind);
+        std::vector<uint8_t> fused;
+        fused.reserve(q_qk.size() + k_qk.size() + v_qk.size());
+        fused.insert(fused.end(), q_qk.begin(), q_qk.end());
+        fused.insert(fused.end(), k_qk.begin(), k_qk.end());
+        fused.insert(fused.end(), v_qk.begin(), v_qk.end());
+        lw.qkv.qk.assign(fused);
+        lw.qkv.qk_segs = {{q_kind, 0, 0}, {k_kind, qb, qe}, {v_kind, qb + kb, qe + ke}};
+        lw.qkv.f16.free();
+        lw.qkv.q8.free();
+        lw.qkv.qsc.free();
+        lw.qkv.is_q8 = false;
       } else {
         std::vector<uint16_t> fused;
         concat_rows_u(fused, q_u, k_u, v_u);
         upload_u16(lw.qkv.f16, fused);
-        lw.qkv.q8.free(); lw.qkv.qsc.free();
+        lw.qkv.q8.free(); lw.qkv.qsc.free(); lw.qkv.qk.free(); lw.qkv.qk_segs.clear();
         lw.qkv.is_q8 = false;
         lw.qkv.bf16 = q_bf16 && k_bf16 && v_bf16;
       }
@@ -272,17 +345,21 @@ void Qwen3Model::load_weights() {
       upload(lw.qkv_bias, qkv_bias_h);
     }
 
-    load_matrix(loader, p + ".self_attn.o_proj.weight", lw.o, true);
+    load_matrix(loader, p + ".self_attn.o_proj.weight", lw.o, true, size_t(hidden) * q_size_);
 
     if (loader.contains(p + ".mlp.gate_up_proj.weight")) {
-      load_matrix(loader, p + ".mlp.gate_up_proj.weight", lw.gate_up, true);
+      load_matrix(loader, p + ".mlp.gate_up_proj.weight", lw.gate_up, true, size_t(2 * inter) * hidden);
     } else {
       std::vector<uint16_t> g_u, u_u;
       bool g_bf16 = false, u_bf16 = false;
       std::vector<uint8_t> g_q8, u_q8;
       bool g_is_q8 = false, u_is_q8 = false;
-      load_matrix_host(loader, p + ".mlp.gate_proj.weight", g_u, g_bf16, g_q8, g_is_q8, true);
-      load_matrix_host(loader, p + ".mlp.up_proj.weight", u_u, u_bf16, u_q8, u_is_q8, true);
+      std::vector<uint8_t> g_qk, u_qk;
+      int g_kind = 0, u_kind = 0;
+      load_matrix_host(loader, p + ".mlp.gate_proj.weight", g_u, g_bf16, g_q8, g_is_q8, g_qk, g_kind,
+                       size_t(inter) * hidden, true);
+      load_matrix_host(loader, p + ".mlp.up_proj.weight", u_u, u_bf16, u_q8, u_is_q8, u_qk, u_kind,
+                       size_t(inter) * hidden, true);
       if (g_is_q8 || u_is_q8) {
         if (!(g_is_q8 && u_is_q8))
           throw std::runtime_error("mixed Q8/non-Q8 gate/up weights are unsupported");
@@ -292,20 +369,38 @@ void Qwen3Model::load_weights() {
         fused.insert(fused.end(), u_q8.begin(), u_q8.end());
         upload_q8_split(lw.gate_up, fused);
         lw.gate_up.f16.free();
+        lw.gate_up.qk.free();
+        lw.gate_up.qk_segs.clear();
         lw.gate_up.is_q8 = true;
+      } else if (g_kind || u_kind) {
+        if (!(g_kind && g_kind == u_kind))
+          throw std::runtime_error("mixed K-quant gate/up needs split dispatch (unsupported)");
+        if ((size_t(inter) * hidden) % 256)
+          throw std::runtime_error("K-quant gate/up split is not on a super-block boundary");
+        size_t gb = size_t(inter) * hidden / 256 * GGUFLoader::qk_block_bytes(g_kind);
+        std::vector<uint8_t> fused;
+        fused.reserve(g_qk.size() + u_qk.size());
+        fused.insert(fused.end(), g_qk.begin(), g_qk.end());
+        fused.insert(fused.end(), u_qk.begin(), u_qk.end());
+        lw.gate_up.qk.assign(fused);
+        lw.gate_up.qk_segs = {{g_kind, 0, 0}, {u_kind, gb, size_t(inter) * hidden}};
+        lw.gate_up.f16.free();
+        lw.gate_up.q8.free();
+        lw.gate_up.qsc.free();
+        lw.gate_up.is_q8 = false;
       } else {
         std::vector<uint16_t> fused;
         fused.reserve(g_u.size() + u_u.size());
         fused.insert(fused.end(), g_u.begin(), g_u.end());
         fused.insert(fused.end(), u_u.begin(), u_u.end());
         upload_u16(lw.gate_up.f16, fused);
-        lw.gate_up.q8.free(); lw.gate_up.qsc.free();
+        lw.gate_up.q8.free(); lw.gate_up.qsc.free(); lw.gate_up.qk.free(); lw.gate_up.qk_segs.clear();
         lw.gate_up.is_q8 = false;
         lw.gate_up.bf16 = g_bf16 && u_bf16;
       }
     }
 
-    load_matrix(loader, p + ".mlp.down_proj.weight", lw.down, true);
+    load_matrix(loader, p + ".mlp.down_proj.weight", lw.down, true, size_t(hidden) * inter);
 
     std::vector<float> ln_h(hidden, 1.0f);
     load_optional(loader, p + ".input_layernorm.weight", ln_h);
@@ -331,7 +426,7 @@ void Qwen3Model::load_weights() {
     tie_lm_head_ = true;
   } else {
     if (loader.contains("lm_head.weight")) {
-      load_matrix(loader, "lm_head.weight", lm_head_, false);
+      load_matrix(loader, "lm_head.weight", lm_head_, false, size_t(hf.vocab_size) * hidden);
       tie_lm_head_ = false;
     } else {
       tie_lm_head_ = true;
@@ -366,21 +461,33 @@ int Qwen3Model::estimate_kv_cache_blocks() const {
 }
 
 static void matmul_dispatch(const float* x, const Matrix& w, int m, int n, int k, float* out) {
-  if (w.is_q8)
+  if (!w.qk_segs.empty())
+    hip_matmul_qk(x, w.qk.d, m, n, k, out, w.qk_segs[0].kind);
+  else if (w.is_q8)
     hip_matmul_q8(x, w.q8.d, w.qsc.d, m, n, k, out);
   else
     hip_matmul_u16(x, w.f16.d, m, n, k, out, w.bf16);
 }
 
 static void matmul_row_dispatch(const float* x, const Matrix& w, size_t elem, int m, int n, int k, float* out) {
-  if (w.is_q8)
+  if (!w.qk_segs.empty()) {
+    const QKSeg* seg = &w.qk_segs[0];
+    for (auto& s : w.qk_segs)
+      if (elem >= s.elem_off) seg = &s;
+    size_t bb = GGUFLoader::qk_block_bytes(seg->kind);
+    if (!bb || (elem - seg->elem_off) % 256)
+      throw std::runtime_error("K-quant row split off super-block boundary");
+    hip_matmul_qk(x, w.qk.d + seg->byte_off + (elem - seg->elem_off) / 256 * bb, m, n, k, out, seg->kind);
+  } else if (w.is_q8)
     hip_matmul_q8(x, w.q8.d + elem, w.qsc.d + elem / 32, m, n, k, out);
   else
     hip_matmul_u16(x, w.f16.d + elem, m, n, k, out, w.bf16);
 }
 
 static void embedding_dispatch(const int64_t* ids, const Matrix& w, int tokens, int hidden, float* out) {
-  if (w.is_q8)
+  if (!w.qk_segs.empty())
+    hip_embedding_qk(ids, w.qk.d, tokens, hidden, out, w.qk_segs[0].kind);
+  else if (w.is_q8)
     hip_embedding_q8(ids, w.q8.d, w.qsc.d, tokens, hidden, out);
   else
     hip_embedding_u16(ids, w.f16.d, tokens, hidden, out, w.bf16);
@@ -456,15 +563,14 @@ std::vector<float> Qwen3Model::forward_logits(const Context& ctx) {
     matmul_row_dispatch(norm_dev.ptr(), lw.qkv, size_t(q_size_) * hidden, rows, kv_size_, hidden, k_dev.ptr());
     matmul_row_dispatch(norm_dev.ptr(), lw.qkv, size_t(q_size_ + kv_size_) * hidden, rows, kv_size_, hidden,
                         v_dev.ptr());
-
     if (lw.qkv_bias.n) {
       hip_add_bias_inplace(q_dev.ptr(), lw.qkv_bias.d, rows, q_size_);
       hip_add_bias_inplace(k_dev.ptr(), lw.qkv_bias.d + q_size_, rows, kv_size_);
       hip_add_bias_inplace(v_dev.ptr(), lw.qkv_bias.d + q_size_ + kv_size_, rows, kv_size_);
     }
 
-    if (lw.q_norm.n) hip_rms_norm(q_dev.ptr(), lw.q_norm.d, q_dev.ptr(), rows, head_dim, eps);
-    if (lw.k_norm.n) hip_rms_norm(k_dev.ptr(), lw.k_norm.d, k_dev.ptr(), rows, head_dim, eps);
+    if (lw.q_norm.n) hip_rms_norm(q_dev.ptr(), lw.q_norm.d, q_dev.ptr(), rows * heads, head_dim, eps);
+    if (lw.k_norm.n) hip_rms_norm(k_dev.ptr(), lw.k_norm.d, k_dev.ptr(), rows * kv_heads, head_dim, eps);
 
     hip_rope_inplace(q_dev.ptr(), d_pos.ptr(), rows, heads, head_dim, q_size_, inv_freq_.d);
     hip_rope_inplace(k_dev.ptr(), d_pos.ptr(), rows, kv_heads, head_dim, kv_size_, inv_freq_.d);
@@ -475,8 +581,8 @@ std::vector<float> Qwen3Model::forward_logits(const Context& ctx) {
     hip_paged_attention(q_dev.ptr(), attn_dev.ptr(), k_layer, v_layer, d_qseq.ptr(), d_qlen.ptr(),
                         d_tables.ptr(), rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale);
 
-    matmul_dispatch(attn_dev.ptr(), lw.o, rows, hidden, q_size_, hidden_dev.ptr());
-    hip_rms_norm_add(hidden_dev.ptr(), residual_dev.ptr(), lw.post_ln.d, norm_dev.ptr(), rows, hidden, eps);
+     matmul_dispatch(attn_dev.ptr(), lw.o, rows, hidden, q_size_, hidden_dev.ptr());
+     hip_rms_norm_add(hidden_dev.ptr(), residual_dev.ptr(), lw.post_ln.d, norm_dev.ptr(), rows, hidden, eps);
 
     matmul_dispatch(norm_dev.ptr(), lw.gate_up, rows, 2 * inter, hidden, gate_dev.ptr());
     hip_silu_and_mul(gate_dev.ptr(), mlp_dev.ptr(), rows, inter);

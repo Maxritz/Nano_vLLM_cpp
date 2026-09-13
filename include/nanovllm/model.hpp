@@ -11,13 +11,17 @@
 #include "hip_ops.hpp"
 #include "safetensors.hpp"
 
-// A weight matrix that lives on device in one of two encodings:
+// A weight matrix that lives on device in one of three encodings:
 //  - half: DevVec<uint16_t> F16/BF16
 //  - q8:   DevVec<uint8_t>  Q8_0 blocks (34 bytes per 32 elements) -- in-kernel dequant
+//  - qk:   DevVec<uint8_t>  raw K-quant super-blocks (QK_K=256 elements each,
+//            e.g. 144B for Q4_K, 210B for Q6_K) -- in-kernel dequant, zero bloat
 struct Matrix {
   DevVec<uint16_t> f16;
   DevVec<uint8_t> q8;    // int8 weight plane (Q8_0, rows contiguous)
   DevVec<uint16_t> qsc;  // fp16 block scales plane, one per 32 elements
+  DevVec<uint8_t> qk;    // raw K-quant blocks, row-major super-blocks
+  std::vector<QKSeg> qk_segs;  // per-segment (kind, byte_off, elem_off); singles hold one
   bool bf16 = false;
   bool is_q8 = false;
 };

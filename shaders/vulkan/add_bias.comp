@@ -1,0 +1,13 @@
+// Mirrors hip_ops.hip add_bias_kernel. Bit-exact.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int rows; int cols; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BBIAS { float bias[]; };
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.rows)) return;
+    uint t = gl_LocalInvocationIndex;
+    for (int c = int(t); c < pc.cols; c += 256) x[row*uint(pc.cols)+uint(c)] += bias[c];
+}

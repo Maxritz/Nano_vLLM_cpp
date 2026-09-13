@@ -14,6 +14,12 @@ project(nanovllm CXX HIP)
 find_package(hip CONFIG REQUIRED)
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp" "src/*.hip")
+# Vulkan backend sources are plain C++ (host compiler), not HIP. Exclude them from
+# the HIP-globbed SOURCES list so they aren't compiled with hipcc.
+list(REMOVE_ITEM SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_backend.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main_vulkan.cpp")
 add_executable(nanovllm ${SOURCES})
 set_source_files_properties(${SOURCES} PROPERTIES LANGUAGE HIP)
 target_include_directories(nanovllm PRIVATE include)
@@ -48,4 +54,43 @@ configure_hip_runtime(nanovllm)
 configure_hip_runtime(nanovllm_test)
 configure_hip_runtime(nanovllm_golden)
 
+# HIP single-sequence top-5 dump (adjudication/debug tool, no Python needed).
+add_executable(hip_seq_top5 ${SOURCES} tools/hip_seq_top5.cpp)
+set_source_files_properties(${SOURCES} tools/hip_seq_top5.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(hip_seq_top5 PRIVATE include test)
+target_compile_options(hip_seq_top5 PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O2 -Wno-unused-variable -Wno-unused-parameter>)
+set_target_properties(hip_seq_top5 PROPERTIES HIP_ARCHITECTURES "${HIP_ARCHITECTURES}")
+target_link_libraries(hip_seq_top5 PRIVATE hip::host hip::device)
+configure_hip_runtime(hip_seq_top5)
+
+# Host fp32 prefill reference (exact-math adjudicator, no GPU): same loader path,
+# plain C++ like the Vulkan targets (HIP headers only, no HIP link).
+add_executable(ref_top5 tools/ref_top5.cpp src/gguf.cpp src/safetensors.cpp src/tokenizer.cpp)
+target_include_directories(ref_top5 PRIVATE include "$ENV{HIP_PATH}/include")
+target_compile_options(ref_top5 PRIVATE -O2 -Wno-unused-variable -Wno-unused-parameter
+    -Wno-deprecated-declarations)
+
 message(STATUS "Target AMD GPUs: ${HIP_ARCHITECTURES}")
+
+# ── Vulkan backend (experimental, uses G:\VAiT) ──────────────────────────────
+set(VAIT_ROOT "G:/VAiT" CACHE PATH "Path to VAiT repo (Vulkan BLAS/GGUF/runtime libs)")
+if(VAIT_ROOT AND EXISTS "${VAIT_ROOT}/include/vkblas/vkblas.h")
+  find_package(Vulkan REQUIRED)
+  set(VAIT_LIB_DIR "${VAIT_ROOT}/build-vk/Release")
+add_executable(nanovllm_vulkan src/vulkan_backend.cpp src/vulkan_model.cpp src/main_vulkan.cpp
+    src/gguf.cpp src/safetensors.cpp src/tokenizer.cpp)
+target_include_directories(nanovllm_vulkan PRIVATE include "${VAIT_ROOT}/include"
+    "${Vulkan_INCLUDE_DIR}" "$ENV{HIP_PATH}/include")
+target_compile_options(nanovllm_vulkan PRIVATE -O2 -Wno-unused-variable -Wno-unused-parameter
+    -Wno-deprecated-declarations)
+target_link_libraries(nanovllm_vulkan PRIVATE
+    "${VAIT_LIB_DIR}/vkruntime.lib"
+    Vulkan::Vulkan)
+
+# Vulkan golden/compare test: same model, compares argmax token prefixes vs the reference.
+add_executable(vk_golden_test test/vk_golden_test.cpp src/vulkan_backend.cpp src/vulkan_model.cpp
+    src/gguf.cpp src/safetensors.cpp src/tokenizer.cpp)
+target_include_directories(vk_golden_test PRIVATE include test "${VAIT_ROOT}/include" "${Vulkan_INCLUDE_DIR}" "$ENV{HIP_PATH}/include")
+target_compile_options(vk_golden_test PRIVATE -O2 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations)
+target_link_libraries(vk_golden_test PRIVATE "${VAIT_LIB_DIR}/vkruntime.lib" Vulkan::Vulkan)
+endif()

@@ -1,0 +1,31 @@
+// Mirrors hip_ops.hip embedding_q8_kernel (q8 int8 + fp16-scale). Bit-exact.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int hidden; int total; } pc;
+layout(std430, binding = 0) buffer BIDS { int64_t ids[]; };
+layout(std430, binding = 1) buffer BW8 { uint8_t  w8[]; };
+layout(std430, binding = 2) buffer BWS { uint16_t ws[]; };
+layout(std430, binding = 3) buffer BY { float y[]; };
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1fu, mant = h & 0x3ffu; uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else { // fp16 subnormal: value = mant * 2^-24; normalize into f32
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    }
+    else if (exp == 0x1fu) bits = sign | 0x7f800000u | (mant << 13);
+    else bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+    return bits;
+}
+void main() {
+    uint idx = uint(gl_WorkGroupID.x) * 256 + gl_LocalInvocationIndex;
+    if (idx >= uint(pc.total)) return;
+    uint token = idx / uint(pc.hidden), col = idx % uint(pc.hidden);
+    uint e = uint(ids[token]) * uint(pc.hidden) + col;
+    y[idx] = uintBitsToFloat(fp16_to_float_u(ws[e >> 5])) * float(int8_t(w8[e]));
+}

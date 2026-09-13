@@ -18,12 +18,15 @@ __device__ __forceinline__ float fp16_to_float_u(uint16_t h) {
   unsigned int mant = h & 0x3ffu;
   float f;
   if (exp == 0) {
-    if (mant == 0) f = __int_as_float(sign);
-    else f = __int_as_float(sign | 0x7b800000u) * __int_as_float(1.0f);
+    if (mant == 0) {
+      f = __int_as_float(sign);
+    } else {
+      f = __int_as_float(sign | 0x7b800000u) * __int_as_float(1.0f);
+    }
   } else if (exp == 0x1fu) {
     f = __int_as_float(sign | 0x7f800000u | (mant << 13));
   } else {
-    f = __int_as_float(sign | ((exp - 15 + 127) << 23) | (mant << 13));
+    f = __int_as_float(sign | ((exp - 15u + 127u) << 23) | (mant << 13));
   }
   return f;
 }
@@ -82,6 +85,111 @@ __global__ void matmul_q8_kernel(const float* __restrict__ x, const uint8_t* __r
     __syncthreads();
   }
   if (row < m && col < n) out[(int64_t)row * n + col] = acc;
+}
+
+// QK_K=256 super-block inline dequant (native K-quants, zero VRAM bloat).
+// Layouts mirror the GGUF spec: Q4_K = [fp16 d][fp16 dmin][12B scales][128B qs],
+// Q6_K = [128B ql][64B qh][16 x int8 scales][fp16 d]. Element (b*256+i).
+// K-quant block scalars (d, dmin) are frequently subnormal fp16; decode them with a
+// mantissa-aware path (mirrors the GLSL shader + host reference), distinct from the
+// legacy fp16_to_float_u used by the F16/Q8 matmul paths so those goldens are unchanged.
+__device__ __forceinline__ float qk_fp16_to_float(uint16_t h) {
+  unsigned int sign = (h & 0x8000u) << 16;
+  unsigned int exp = (h >> 10) & 0x1fu;
+  unsigned int mant = h & 0x3ffu;
+  float f;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = __int_as_float(sign);
+    } else {
+      unsigned int e = 127 - 15 + 1, m = mant;
+      while ((m & 0x400u) == 0u) { m <<= 1u; --e; }
+      f = __int_as_float(sign | (e << 23) | ((m & 0x3FFu) << 13));
+    }
+  } else if (exp == 0x1fu) {
+    f = __int_as_float(sign | 0x7f800000u | (mant << 13));
+  } else {
+    f = __int_as_float(sign | ((exp - 15u + 127u) << 23) | (mant << 13));
+  }
+  return f;
+}
+__device__ __forceinline__ void qk_scales_q4(const uint8_t* sc12, int j, float d, float dmin,
+                                             float* s, float* mn) {
+  uint8_t sc, m8;
+  if (j < 4) {
+    sc = sc12[j] & 63;
+    m8 = sc12[j + 4] & 63;
+  } else {
+    sc = (sc12[j + 4] & 0xF) | ((sc12[j - 4] >> 6) << 4);
+    m8 = (sc12[j + 4] >> 4) | ((sc12[j] >> 6) << 4);
+  }
+  *s = d * sc;
+  *mn = dmin * m8;
+}
+
+__device__ __forceinline__ float qk_w_q4(const uint8_t* blk, int i) {
+  uint16_t dh = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+  uint16_t dmh = (uint16_t)blk[2] | ((uint16_t)blk[3] << 8);
+  float d = qk_fp16_to_float(dh), dmin = qk_fp16_to_float(dmh);
+  int j = i >> 5, e = i & 31;
+  float s, mn;
+  qk_scales_q4(blk + 4, j, d, dmin, &s, &mn);
+  uint8_t qb = blk[16 + j * 16 + (e & 15)];
+  int q = (e < 16) ? (qb & 0xF) : (qb >> 4);
+  return s * (float)q - mn;
+}
+
+__device__ __forceinline__ float qk_w_q5(const uint8_t* blk, int i) {
+  int group = i >> 6, slot = (i & 63) >> 5, l = i & 31;
+  int is = group * 2, j = is + slot;
+  float d = qk_fp16_to_float((uint16_t)(blk[0] | (blk[1] << 8)));
+  float dmin = qk_fp16_to_float((uint16_t)(blk[2] | (blk[3] << 8)));
+  float s, mn;
+  qk_scales_q4(blk + 4, j, d, dmin, &s, &mn);
+  const uint8_t* ql = blk + 48;
+  const uint8_t* qh = blk + 16;
+  uint8_t qhl = qh[l];
+  int q = (slot == 0) ? (ql[group * 32 + l] & 0xF) : (ql[group * 32 + l] >> 4);
+  int qhbit = (slot == 0) ? (qhl & (1u << (group * 2))) : (qhl & (2u << (group * 2)));
+  return s * (float)(q + (qhbit ? 16 : 0)) - mn;
+}
+
+__device__ __forceinline__ float qk_w_q6(const uint8_t* blk, int i) {
+  int half = i >> 7, t = i & 127;
+  const uint8_t* ql = blk + half * 64;
+  const uint8_t* qh = blk + 128 + half * 32;
+  const int8_t* sc = (const int8_t*)(blk + 192 + half * 8);
+  uint16_t dh = (uint16_t)blk[208] | ((uint16_t)blk[209] << 8);
+  float d = qk_fp16_to_float(dh);
+  int l = t & 31, slot = t >> 5, is = l >> 4;
+  uint8_t qhl = qh[l];
+  int q;
+  float s;
+  if (slot == 0) {
+    q = (ql[l] & 0xF) | (((qhl >> 0) & 3) << 4);
+    s = (float)sc[is + 0];
+  } else if (slot == 1) {
+    q = (ql[l + 32] & 0xF) | (((qhl >> 2) & 3) << 4);
+    s = (float)sc[is + 2];
+  } else if (slot == 2) {
+    q = (ql[l] >> 4) | (((qhl >> 4) & 3) << 4);
+    s = (float)sc[is + 4];
+  } else {
+    q = (ql[l + 32] >> 4) | (((qhl >> 6) & 3) << 4);
+    s = (float)sc[is + 6];
+  }
+  return d * s * ((float)q - 32.0f);
+}
+
+__device__ __forceinline__ float qk_w(const uint8_t* wq, int64_t idx, int kind, int bb) {
+  int64_t b = idx >> 8;
+   int i = (int)(idx & 255);
+   const uint8_t* blk = wq + b * bb;
+   float v;
+   if (kind == 12) v = qk_w_q4(blk, i);
+   else if (kind == 13) v = qk_w_q5(blk, i);
+   else v = qk_w_q6(blk, i);
+   return v;
 }
 
 // RDNA4 (gfx1201) has no signed V_DOT4_I32_I8 via inline asm; amd_mixed_dot
@@ -465,6 +573,41 @@ __global__ void embedding_q8_kernel(const int64_t* __restrict__ ids, const uint8
   out[(int64_t)token * hidden + col] = fp16_to_float_u(ws[e >> 5]) * (float)(int8_t)w8[e];
 }
 
+// TILE=16 twin of matmul_q8_kernel over raw K-quant super-blocks (same grid math).
+__global__ void matmul_qk_kernel(const float* __restrict__ x, const uint8_t* __restrict__ wq,
+                                 int m, int n, int k, float* __restrict__ out, int kind, int bb) {
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int row = blockIdx.y * TILE + ty;
+  int col = blockIdx.x * TILE + tx;
+  float acc = 0.0f;
+  __shared__ float As[TILE][TILE];
+  __shared__ float Bs[TILE][TILE];
+  for (int kt = 0; kt < (k + TILE - 1) / TILE; ++kt) {
+    int ak = kt * TILE + tx;
+    int row_abs = blockIdx.y * TILE + ty;
+    As[ty][tx] = (row_abs < m && ak < k) ? x[(int64_t)row_abs * k + ak] : 0.0f;
+    int br = blockIdx.x * TILE + tx;
+    int bk = kt * TILE + ty;
+    int64_t idx = (int64_t)br * k + bk;
+    Bs[ty][tx] = (br < n && bk < k) ? qk_w(wq, idx, kind, bb) : 0.0f;
+    __syncthreads();
+    for (int a = 0; a < TILE; ++a) acc += As[ty][a] * Bs[a][tx];
+    __syncthreads();
+  }
+  if (row < m && col < n) out[(int64_t)row * n + col] = acc;
+}
+
+__global__ void embedding_qk_kernel(const int64_t* __restrict__ ids, const uint8_t* __restrict__ wq,
+                                    int hidden, int total, float* __restrict__ out, int kind, int bb) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int token = idx / hidden;
+  int col = idx % hidden;
+  int64_t id = ids[token];
+  int64_t e = id * hidden + col;
+  out[(int64_t)token * hidden + col] = qk_w(wq, e, kind, bb);
+}
+
 __global__ void gather_rows_kernel(const float* __restrict__ rows, const int32_t* __restrict__ indices, int cols,
                                    int total, float* __restrict__ out) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -621,6 +764,24 @@ void hip_embedding_q8(const int64_t* ids, const uint8_t* w8, const uint16_t* ws,
   int total = tokens * hidden;
   int block = 256;
   embedding_q8_kernel<<<(total + block - 1) / block, block>>>(ids, w8, ws, hidden, total, out);
+  HIP_CHECK(hipGetLastError());
+}
+
+void hip_matmul_qk(const float* x, const uint8_t* wq, int m, int n, int k, float* out, int kind) {
+  if (m <= 0 || n <= 0 || k <= 0) return;
+  int bb = (kind == 12) ? 144 : (kind == 13 ? 176 : 210);
+  dim3 blocks((n + TILE - 1) / TILE, (m + TILE - 1) / TILE);
+  dim3 threads(TILE, TILE);
+  matmul_qk_kernel<<<blocks, threads>>>(x, wq, m, n, k, out, kind, bb);
+  HIP_CHECK(hipGetLastError());
+}
+
+void hip_embedding_qk(const int64_t* ids, const uint8_t* wq, int tokens, int hidden, float* out, int kind) {
+  if (tokens <= 0 || hidden <= 0) return;
+  int total = tokens * hidden;
+  int block = 256;
+  int bb = (kind == 12) ? 144 : (kind == 13 ? 176 : 210);
+  embedding_qk_kernel<<<(total + block - 1) / block, block>>>(ids, wq, hidden, total, out, kind, bb);
   HIP_CHECK(hipGetLastError());
 }
 

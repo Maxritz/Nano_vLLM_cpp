@@ -1,0 +1,84 @@
+// Mirrors hip_ops.hip paged_attention_kernel (chunked online softmax over paged KV). Bit-exact.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#define MAX_HEAD_DIM 256
+#define ATTN_THREADS 64
+#define ATTN_CHUNK 64
+#define MAX_DIM_PER_THREAD ((MAX_HEAD_DIM + ATTN_THREADS - 1) / ATTN_THREADS)
+layout(local_size_x = ATTN_THREADS) in;
+layout(push_constant) uniform PC {
+    int tokens, q_heads, kv_heads, head_dim, block_size, max_blocks; float scale;
+} pc;
+layout(std430, binding = 0) buffer BQ { float q[]; };
+layout(std430, binding = 1) buffer BOUT { float g_out[]; };
+layout(std430, binding = 2) buffer BKC { float k_cache[]; };
+layout(std430, binding = 3) buffer BV { float v_cache[]; };
+layout(std430, binding = 4) buffer BQSEQ { int32_t query_seq[]; };
+layout(std430, binding = 5) buffer BQKL { int32_t query_key_len[]; };
+layout(std430, binding = 6) buffer BBLOCKS { int32_t block_tables[]; };
+shared float q_sh[MAX_HEAD_DIM];
+shared float scores[ATTN_CHUNK];
+uint kv_ptr(uint block_idx, int offset, int kv_head) {
+    return (block_idx * uint(pc.block_size) + uint(offset)) * uint(pc.kv_heads) + uint(kv_head);
+}
+void main() {
+    if (pc.head_dim > MAX_HEAD_DIM) return;
+    if (int(gl_WorkGroupID.x) >= pc.tokens || int(gl_WorkGroupID.y) >= pc.q_heads) return;
+    uint token = gl_WorkGroupID.x, head = gl_WorkGroupID.y, t = gl_LocalInvocationIndex;
+    int seq = query_seq[int(token)], key_len = query_key_len[int(token)];
+    int kv_head = int(head) / (pc.q_heads / pc.kv_heads);
+    int q_stride = pc.q_heads * pc.head_dim;
+    for (int d = int(t); d < pc.head_dim; d += ATTN_THREADS) q_sh[d] = q[token*uint(q_stride) + head*uint(pc.head_dim) + uint(d)];
+    barrier();
+    for (int d = int(t); d < ATTN_CHUNK; d += ATTN_THREADS) scores[d] = -1e30f;
+    if (key_len <= 0) {
+        for (int d = int(t); d < pc.head_dim; d += ATTN_THREADS) g_out[token*uint(q_stride)+head*uint(pc.head_dim)+uint(d)] = 0.0;
+        return;
+    }
+    float m = -1e30f, s = 0.0f;
+    float acc[MAX_DIM_PER_THREAD];
+    for (int a = 0; a < MAX_DIM_PER_THREAD; ++a) acc[a] = 0.0;
+    for (int key0 = 0; key0 < key_len; key0 += ATTN_CHUNK) {
+        int n = key_len - key0; if (n > ATTN_CHUNK) n = ATTN_CHUNK;
+        float sc = -1e30f;
+        if (int(t) < n) {
+            int key_idx = key0 + int(t);
+            int block_idx = block_tables[uint(seq) * uint(pc.max_blocks) + uint(key_idx / pc.block_size)];
+            int offset = key_idx % pc.block_size;
+            uint kp = kv_ptr(uint(block_idx), offset, kv_head);
+            float dot = 0.0f;
+            for (int d = 0; d < pc.head_dim; ++d) dot += q_sh[d] * k_cache[kp*uint(pc.head_dim)+uint(d)];
+            sc = dot * pc.scale;
+        }
+        scores[t] = sc; barrier(); barrier();
+        float chunk_m = -1e30f;
+        for (int i = 0; i < n; ++i) chunk_m = max(chunk_m, scores[i]);
+        float sum_e = 0.0f;
+        for (int i = 0; i < n; ++i) sum_e += exp(scores[i] - chunk_m);
+        float new_m = max(m, chunk_m);
+        float m_scale = exp(m - new_m), chunk_scale = exp(chunk_m - new_m);
+        s = s * m_scale + sum_e * chunk_scale;
+        for (int a = 0; a < MAX_DIM_PER_THREAD; ++a) acc[a] *= m_scale;
+        for (int local = 0; local < MAX_DIM_PER_THREAD; ++local) {
+            int d = local * ATTN_THREADS + int(t);
+            if (d >= pc.head_dim) continue;
+            float val = 0.0f;
+            for (int j = 0; j < n; ++j) {
+                int key_idx = key0 + j;
+                int block_idx = block_tables[uint(seq)*uint(pc.max_blocks) + uint(key_idx/pc.block_size)];
+                int offset = key_idx % pc.block_size;
+                uint vp = kv_ptr(uint(block_idx), offset, kv_head);
+                val += exp(scores[j] - chunk_m) * v_cache[vp*uint(pc.head_dim)+uint(d)];
+            }
+            acc[local] += chunk_scale * val;
+        }
+        m = new_m; barrier(); barrier();
+    }
+    float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
+    for (int local = 0; local < MAX_DIM_PER_THREAD; ++local) {
+        int d = local * ATTN_THREADS + int(t);
+        if (d >= pc.head_dim) continue;
+        g_out[token*uint(q_stride)+head*uint(pc.head_dim)+uint(d)] = acc[local] * inv_s;
+    }
+}

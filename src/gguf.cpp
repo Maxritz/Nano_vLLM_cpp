@@ -16,6 +16,7 @@ enum GGUFType {
 
 enum GGMLType {
   M_F32 = 0, M_F16 = 1, M_Q4_0 = 2, M_Q4_1 = 3, M_Q5_0 = 6, M_Q5_1 = 7, M_Q8_0 = 8, M_Q8_1 = 9,
+  M_Q2_K = 10, M_Q3_K = 11, M_Q4_K = 12, M_Q5_K = 13, M_Q6_K = 14, M_Q8_K = 15,
   M_BF16 = 30,
 };
 
@@ -62,6 +63,12 @@ std::string ggml_type_name(uint32_t t) {
     case M_Q4_1: return "Q4_1";
     case M_Q5_0: return "Q5_0";
     case M_Q5_1: return "Q5_1";
+    case M_Q2_K: return "Q2_K";
+    case M_Q3_K: return "Q3_K";
+    case M_Q4_K: return "Q4_K";
+    case M_Q5_K: return "Q5_K";
+    case M_Q6_K: return "Q6_K";
+    case M_Q8_K: return "Q8_K";
     default: return "UNKNOWN" + std::to_string(t);
   }
 }
@@ -283,6 +290,31 @@ bool GGUFLoader::load_q8_0(const std::string& name, std::vector<uint8_t>& out) c
   for (int64_t d : m->shape) n *= static_cast<size_t>(d);
   size_t nblocks = (n + 31) / 32;
   out.resize(nblocks * 34);
+  read_tensor_data(*m, out.data(), out.size());
+  return true;
+}
+
+size_t GGUFLoader::qk_block_bytes(int ggml_type) {
+  switch (ggml_type) {
+    case 12: return 144;  // Q4_K
+    case 13: return 176;  // Q5_K
+    case 14: return 210;  // Q6_K
+    default: return 0;
+  }
+}
+
+bool GGUFLoader::load_qk(const std::string& name, int ggml_type, size_t n_elements,
+                          std::vector<uint8_t>& out) const {
+  size_t bb = qk_block_bytes(ggml_type);
+  if (!bb || n_elements % QK_K != 0) return false;
+  const GGUFTensorMeta* m = tensor(name);
+  if (!m) return false;
+  size_t n = 1;
+  for (int64_t d : m->shape) n *= static_cast<size_t>(d);
+  if (n != n_elements) return false;
+  // Verify the on-disk dtype matches the requested kind (fail loud, never misread).
+  if (m->dtype != ggml_type_name((uint32_t)ggml_type)) return false;
+  out.resize(n_elements / QK_K * bb);
   read_tensor_data(*m, out.data(), out.size());
   return true;
 }

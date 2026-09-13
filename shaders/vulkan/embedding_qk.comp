@@ -1,0 +1,81 @@
+// Embedding gather over raw K-quant super-blocks (QK_K=256).
+// kind: 12=Q4_K (144B/blk), 13=Q5_K (176B/blk), 14=Q6_K (210B/blk).
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int hidden; int total; int kind; } pc;
+layout(std430, binding = 0) buffer BIDS { int64_t ids[]; };
+layout(std430, binding = 1) buffer BWQ { uint8_t wq[]; };
+layout(std430, binding = 2) buffer BY { float y[]; };
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint exp = (h >> 10) & 0x1fu;
+    uint mant = h & 0x3ffu; uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else {
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    }
+    else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
+    return bits;
+}
+float qk_q4(uint base, uint i) {
+    uint dh = uint(wq[base]) | (uint(wq[base + 1u]) << 8);
+    uint dmh = uint(wq[base + 2u]) | (uint(wq[base + 3u]) << 8);
+    float d = uintBitsToFloat(fp16_to_float_u(dh));
+    float dmin = uintBitsToFloat(fp16_to_float_u(dmh));
+    uint j = i >> 5, e = i & 31u;
+    uint b4 = base + 4u;
+    uint sc, mn;
+    if (j < 4u) { sc = wq[b4 + j] & 63u; mn = wq[b4 + j + 4u] & 63u; }
+    else { sc = (wq[b4 + j + 4u] & 0xFu) | ((wq[b4 + j - 4u] >> 6) << 4); mn = (wq[b4 + j + 4u] >> 4) | ((wq[b4 + j] >> 6) << 4); }
+    uint qb = wq[base + 16u + j * 16u + (e & 15u)];
+    uint q = (e < 16u) ? (qb & 0xFu) : (qb >> 4);
+    return d * float(sc) * float(q) - dmin * float(mn);
+}
+float qk_q5(uint base, uint i) {
+    uint group = i >> 6, slot = (i & 63u) >> 5, l = i & 31u;
+    uint is = group * 2u, j = is + slot;
+    uint u1 = 1u << (group * 2u), u2 = 2u << (group * 2u);
+    uint b4 = base + 4u;
+    uint sc, mn;
+    if (j < 4u) { sc = wq[b4 + j] & 63u; mn = wq[b4 + j + 4u] & 63u; }
+    else { sc = (wq[b4 + j + 4u] & 0xFu) | ((wq[b4 + j - 4u] >> 6) << 4); mn = (wq[b4 + j + 4u] >> 4) | ((wq[b4 + j] >> 6) << 4); }
+    uint ql = base + 48u, qh = base + 16u;
+    uint qhl = wq[qh + l];
+    uint q = slot == 0u ? (wq[ql + group*32u + l] & 0xFu) : (wq[ql + group*32u + l] >> 4);
+    uint hbit = slot == 0u ? (qhl & u1) : (qhl & u2);
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base]) | (uint(wq[base + 1u]) << 8)));
+    float dmin = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 2u]) | (uint(wq[base + 3u]) << 8)));
+    return d * float(sc) * float(q + (hbit != 0u ? 16 : 0)) - dmin * float(mn);
+}
+float qk_q6(uint base, uint i) {
+    uint ha = i >> 7, t = i & 127u;
+    uint ql = base + ha * 64u, qh = base + 128u + ha * 32u, sb = base + 192u + ha * 8u;
+    uint dh = uint(wq[base + 208u]) | (uint(wq[base + 209u]) << 8);
+    float d = uintBitsToFloat(fp16_to_float_u(dh));
+    uint l = t & 31u, slot = t >> 5, is = l >> 4;
+    uint qhl = wq[qh + l];
+    uint q; int s;
+    uint su;
+    if (slot == 0u) { q = (wq[ql + l] & 0xFu) | (((qhl >> 0) & 3u) << 4); su = wq[sb + is]; }
+    else if (slot == 1u) { q = (wq[ql + l + 32u] & 0xFu) | (((qhl >> 2) & 3u) << 4); su = wq[sb + is + 2u]; }
+    else if (slot == 2u) { q = (wq[ql + l] >> 4) | (((qhl >> 4) & 3u) << 4); su = wq[sb + is + 4u]; }
+    else { q = (wq[ql + l + 32u] >> 4) | (((qhl >> 6) & 3u) << 4); su = wq[sb + is + 6u]; }
+    s = su > 127u ? int(su) - 256 : int(su);
+    return d * float(s) * (float(q) - 32.0);
+}
+void main() {
+    uint idx = uint(gl_WorkGroupID.x) * 256 + gl_LocalInvocationIndex;
+    if (idx >= uint(pc.total)) return;
+    uint token = idx / uint(pc.hidden), col = idx % uint(pc.hidden);
+    uint e = uint(ids[token]) * uint(pc.hidden) + col;
+    uint bb = pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u);
+    uint b = e >> 8, i = e & 255u;
+    y[idx] = (pc.kind == 12) ? qk_q4(b*bb, i) : (pc.kind == 13 ? qk_q5(b*bb, i) : qk_q6(b*bb, i));
+}

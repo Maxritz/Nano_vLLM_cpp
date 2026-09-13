@@ -1,0 +1,45 @@
+// Mirrors hip_ops.hip matmul_q8_kernel (TILE=16, Q8_0 int8+fp16-scale row-major). Bit-exact.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(push_constant) uniform PC { int m, n, k; uint w_off; uint ws_off; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BW8  { uint8_t  w8[]; };
+layout(std430, binding = 2) buffer BWS16 { uint16_t ws[]; };
+layout(std430, binding = 3) buffer BY { float y[]; };
+shared float As[16][16];
+shared float Bs[16][16];
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint exp = (h >> 10) & 0x1fu;
+    uint mant = h & 0x3ffu; uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else { // fp16 subnormal: value = mant * 2^-24; normalize into f32
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    }
+    else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
+    return bits;
+}
+void main() {
+    uint tx = gl_LocalInvocationIndex & 15u, ty = gl_LocalInvocationIndex >> 4;
+    uint row = gl_WorkGroupID.y * 16 + ty, col = gl_WorkGroupID.x * 16 + tx;
+    float acc = 0.0;
+    for (int kt = 0; kt < (pc.k + 15)/16; ++kt) {
+        uint ak = uint(kt)*16 + tx, row_abs = gl_WorkGroupID.y*16 + ty;
+        As[ty][tx] = (row_abs < uint(pc.m) && ak < uint(pc.k)) ? x[row_abs*uint(pc.k)+ak] : 0.0;
+        uint br = gl_WorkGroupID.x*16 + tx, bk = uint(kt)*16 + ty, idx = br*uint(pc.k)+bk;
+        Bs[ty][tx] = (br < uint(pc.n) && bk < uint(pc.k))
+            ? uintBitsToFloat(fp16_to_float_u(ws[idx >> 5])) * float(int8_t(w8[idx]))
+            : 0.0;
+        barrier();
+        for (int a = 0; a < 16; ++a) acc += As[ty][a] * Bs[a][tx];
+        barrier();
+    }
+    if (row < uint(pc.m) && col < uint(pc.n)) y[row*uint(pc.n)+col] = acc;
+}

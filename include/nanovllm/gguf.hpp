@@ -28,6 +28,14 @@ struct GGUFTensorMeta {
   uint64_t offset = 0;    // from start of data section
 };
 
+// One fused K-quant segment: raw super-blocks of a single kind. Fused qkv holds
+// three (q/k/v), fused gate_up two, single matrices one. Resolved by elem offset.
+struct QKSeg {
+  int kind = 0;            // ggml type id (12=Q4_K, 14=Q6_K)
+  size_t byte_off = 0;     // byte offset of this segment in the fused stream
+  size_t elem_off = 0;     // element offset of this segment
+};
+
 // One GGUF metadata KV value. Only the field matching the value's type is meaningful
 // (e.g. string arrays land in sarr, int arrays in iarr, floats in d/farr).
 struct GGUFMetaValue {
@@ -60,6 +68,13 @@ class GGUFLoader {
   bool load_float(const std::string& name, std::vector<float>& out) const;
   // Q8_0: block = [fp16 d][32 x int8], 34 bytes per 32 elements.
   bool load_q8_0(const std::string& name, std::vector<uint8_t>& out) const;
+  // K-quants: raw super-blocks verbatim (QK_K=256 elements each). No conversion,
+  // zero bloat: kernels dequantize inline. Returns false for unknown dtypes.
+  // Supported ggml type ids: 12 (Q4_K, 144B/blk), 14 (Q6_K, 210B/blk).
+  static size_t qk_block_bytes(int ggml_type);
+  static constexpr int QK_K = 256;
+  bool load_qk(const std::string& name, int ggml_type, size_t n_elements,
+               std::vector<uint8_t>& out) const;
 
  private:
   std::string path_;
