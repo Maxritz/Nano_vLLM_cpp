@@ -41,6 +41,12 @@ static std::vector<int> chat_ids(Tokenizer& tok, const std::string& prompt) {
     ids.insert(ids.end(), part.begin(), part.end());
   };
   if (im_start >= 0 && im_end >= 0) {
+    if (tok.chat_auto_system()) {
+      ids.push_back(im_start);
+      append("system\nYou are a helpful assistant.");
+      ids.push_back(im_end);
+      append("\n");
+    }
     ids.push_back(im_start);
     append("user\n" + prompt);
     ids.push_back(im_end);

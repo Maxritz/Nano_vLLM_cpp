@@ -34,3 +34,9 @@ void hip_embedding_qk(const int64_t* ids, const uint8_t* wq, int tokens, int hid
 void hip_gather_rows(const float* rows, const int32_t* indices, int rows_count, int cols, int out_rows, float* out);
 void hip_copy_to_host(const float* dev, std::vector<float>& out, size_t n);
 void hip_copy_from_host(const std::vector<float>& host, float* dev);
+void hip_moe_route(const float* logits, int rows, int E, int K, bool norm, int32_t* idx, float* score);
+void hip_moe_ffn(const float* x, const int32_t* idx, const float* score, const uint16_t* gu,
+                 const uint16_t* dn, const int32_t* slot_of, int rows, int H, int I, int K,
+                 bool bf16, float* out);
+void hip_add_inplace(float* dst, const float* src, size_t n);
+void hip_scale_rows_sigmoid(float* dst, const float* s, int rows, int cols);

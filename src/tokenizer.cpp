@@ -31,6 +31,16 @@ static std::string encode_utf8(uint32_t cp) {
   return out;
 }
 
+static bool chat_auto_injects_system(const std::string& tmpl) {
+  if (tmpl.empty()) return false;
+  if (tmpl.find("!= 'system'") != std::string::npos ||
+      tmpl.find("!= \"system\"") != std::string::npos)
+    return true;
+  size_t pos = 0, count = 0;
+  while ((pos = tmpl.find("You are", pos)) != std::string::npos) { ++count; pos += 7; }
+  return count >= 2;
+}
+
 static std::vector<uint32_t> decode_utf8(const std::string& s) {
   std::vector<uint32_t> out;
   for (size_t i = 0; i < s.size();) {
@@ -168,6 +178,18 @@ bool Tokenizer::load(const std::string& model_dir) {
   };
   set_eos("<|endoftext|>");
   if (eos_id_ < 0) set_eos("<|im_end|>");
+  std::string tc_path = model_dir + "/tokenizer_config.json";
+  std::ifstream tc(tc_path, std::ios::binary);
+  if (tc) {
+    std::string t((std::istreambuf_iterator<char>(tc)), std::istreambuf_iterator<char>());
+    Json root = JsonParser::parse(t);
+    if (root.contains("chat_template")) {
+      const Json& tmpl = root.at("chat_template");
+      if (tmpl.is_string()) {
+        chat_auto_system_ = chat_auto_injects_system(tmpl.as_string());
+      }
+    }
+  }
   loaded_ = true;
   return true;
 }
@@ -220,6 +242,9 @@ bool Tokenizer::load_from_gguf(const std::string& model_dir) {
                  merge_rank_.size(), special_id_.size(), eos_id_);
     std::fflush(stderr);
   }
+  std::string tmpl;
+  bool has_tmpl = g.meta_str("tokenizer.chat_template", tmpl);
+  chat_auto_system_ = has_tmpl ? chat_auto_injects_system(tmpl) : false;
   loaded_ = true;
   return true;
 }

@@ -21,6 +21,9 @@ class Tokenizer {
   int eos_token_id() const { return eos_id_; }
   int vocab_size() const { return static_cast<int>(id_to_piece_.size()); }
   bool loaded() const { return loaded_; }
+  // True when the model's chat template auto-injects a default system turn
+  // (Qwen2-era ChatML templates); tool-gated templates return false.
+bool chat_auto_system() const { return chat_auto_system_; }
 
  private:
   bool load_from_gguf(const std::string& model_dir);
@@ -39,6 +42,7 @@ class Tokenizer {
   int eos_id_ = -1;
   int fallback_vocab_size_ = 0;
   bool loaded_ = false;
+  bool chat_auto_system_ = false;
 
   std::string byte_to_codepoint_utf8(unsigned char b) const;
   std::string bytes_to_byte_level(const std::string& utf8_bytes) const;

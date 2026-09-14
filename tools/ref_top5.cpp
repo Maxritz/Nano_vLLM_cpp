@@ -270,6 +270,10 @@ int main() {
   tok.set_fallback_vocab_size(hf.vocab_size);
   tok.load(config.model);
   std::vector<int> ids = tok.encode_text(prompt);
+  if (const char* ti = std::getenv("REF_TOKENS")) {
+    ids.clear();
+    for (const char* p = ti; *p;) { ids.push_back(atoi(p)); while (*p && *p != ',') ++p; if (*p == ',') ++p; }
+  }
   if (std::getenv("REF_CHAT")) {
     int im_start = tok.encode_special("<|im_start|>");
     int im_end = tok.encode_special("<|im_end|>");
@@ -279,6 +283,12 @@ int main() {
       c.insert(c.end(), part.begin(), part.end());
     };
     if (im_start >= 0 && im_end >= 0) {
+      if (tok.chat_auto_system()) {
+        c.push_back(im_start);
+        append("system\nYou are a helpful assistant.");
+        c.push_back(im_end);
+        append("\n");
+      }
       c.push_back(im_start);
       append(std::string("user\n") + prompt);
       c.push_back(im_end);
@@ -414,6 +424,93 @@ int main() {
     for (int t = 0; t < T; ++t)
       for (int i = 0; i < hidden; ++i) resid[(size_t)t * hidden + i] += hidden_s[(size_t)t * hidden + i];
     rms_norm(resid, postln, T, hidden, eps, norm);
+    if (hf.num_experts > 0 && ((L + 1) % hf.decoder_sparse_step == 0)) {
+      // Sparse layer: compute only the last token's MoE output (oracle feeds last-row logits).
+      const int E = hf.num_experts, K = hf.num_experts_per_tok, I = hf.moe_intermediate_size;
+      const int SI = hf.shared_expert_intermediate_size;
+      std::vector<float> Wr;
+      if (!wl.mat(p + ".mlp.gate.weight", (size_t)E * hidden, Wr))
+        throw std::runtime_error("missing router " + p);
+      std::vector<float> Sg, Su, Sd, Sgw;
+      bool has_sh = (SI > 0 && !std::getenv("REF_NO_SHARED"));
+      if (has_sh) {
+        wl.mat(p + ".mlp.shared_expert.gate_proj.weight", (size_t)SI * hidden, Sg);
+        wl.mat(p + ".mlp.shared_expert.up_proj.weight", (size_t)SI * hidden, Su);
+        wl.mat(p + ".mlp.shared_expert.down_proj.weight", (size_t)hidden * SI, Sd);
+        wl.mat(p + ".mlp.shared_expert_gate.weight", (size_t)hidden, Sgw);
+        if (Sgw.size() != (size_t)hidden) Sgw.clear();
+      }
+      std::vector<std::vector<float>> Eg_c(E), Eu_c(E), Ed_c(E);
+      std::vector<char> loaded(E, 0);
+      for (int t = 0; t < T; ++t) {
+      std::vector<float> x(hidden);
+      memcpy(x.data(), &norm[(size_t)t * hidden], hidden * 4);
+      std::vector<float> rl;
+      matvec(Wr, x, E, hidden, rl);
+      std::vector<int> perm(E);
+      for (int i = 0; i < E; ++i) perm[i] = i;
+      std::vector<double> pr2(E);
+      {
+        double m2 = -1e300, s2 = 0;
+        for (int i = 0; i < E; ++i) m2 = std::max(m2, (double)rl[i]);
+        for (int i = 0; i < E; ++i) { pr2[i] = std::exp((double)rl[i] - m2); s2 += pr2[i]; }
+        for (int i = 0; i < E; ++i) pr2[i] /= s2;
+      }
+      std::vector<int> idx(K);
+      std::vector<double> w(K);
+      for (int i = 0; i < K; ++i) {
+        int best = i;
+        for (int j = i + 1; j < E; ++j) if (pr2[perm[j]] > pr2[perm[best]]) best = j;
+        std::swap(perm[i], perm[best]);
+        idx[i] = perm[i];
+        w[i] = pr2[perm[i]];
+      }
+      if (hf.norm_topk_prob) {
+        double s3 = 0;
+        for (int i = 0; i < K; ++i) s3 += w[i];
+        for (int i = 0; i < K; ++i) w[i] /= s3;
+      }
+      std::vector<float> y(hidden, 0.f);
+      if (t == T - 1) {
+        std::fprintf(stderr, "REF route L%d last:", L);
+        for (int i = 0; i < K; ++i) std::fprintf(stderr, " %d(%.4f)", idx[i], w[i]);
+        std::fprintf(stderr, "\n");
+      }
+      if (has_sh) {
+        std::vector<float> gg, uu, mm;
+        matvec(Sg, x, SI, hidden, gg);
+        matvec(Su, x, SI, hidden, uu);
+        mm.resize(SI);
+        for (int i = 0; i < SI; ++i) mm[i] = gg[i] / (1.0f + std::exp(-gg[i])) * uu[i];
+        std::vector<float> ys;
+        matvec(Sd, mm, hidden, SI, ys);
+        float gs = 0.f;
+        for (int i = 0; i < (int)Sgw.size(); ++i) gs += Sgw[i] * x[i];
+        float gsc = Sgw.empty() ? 1.0f : 1.0f / (1.0f + std::exp(-gs));
+        for (int i = 0; i < hidden; ++i) y[i] += gsc * ys[i];
+      }
+      for (int k = 0; k < K; ++k) {
+        int e = idx[k];
+        if (!loaded[e]) {
+          std::string pe = p + ".mlp.experts." + std::to_string(e) + ".";
+          if (!wl.mat(pe + "gate_proj.weight", (size_t)I * hidden, Eg_c[e])) throw std::runtime_error("missing " + pe);
+          wl.mat(pe + "up_proj.weight", (size_t)I * hidden, Eu_c[e]);
+          wl.mat(pe + "down_proj.weight", (size_t)hidden * I, Ed_c[e]);
+          loaded[e] = 1;
+        }
+        std::vector<float> gg, uu, mm;
+        matvec(Eg_c[e], x, I, hidden, gg);
+        matvec(Eu_c[e], x, I, hidden, uu);
+        mm.resize(I);
+        for (int i = 0; i < I; ++i) mm[i] = gg[i] / (1.0f + std::exp(-gg[i])) * uu[i];
+        std::vector<float> ys;
+        matvec(Ed_c[e], mm, hidden, I, ys);
+        for (int i = 0; i < hidden; ++i) y[i] += (float)w[k] * ys[i];
+      }
+      memcpy(&hidden_s[(size_t)t * hidden], y.data(), hidden * 4);
+      if (t == T - 1 && L < 2) { double am = 0; for (float v : y) am = std::max(am, (double)std::fabs(v)); std::fprintf(stderr, "REF moe L%d |y|_max=%.4f\n", L, am); }
+      }
+    } else {
     std::vector<float> Wg, Wu, Wd;
     wl.mat(p + ".mlp.gate_proj.weight", (size_t)inter * hidden, Wg);
     wl.mat(p + ".mlp.up_proj.weight", (size_t)inter * hidden, Wu);
@@ -429,6 +526,7 @@ int main() {
       std::vector<float> y;
       matvec(Wd, m, hidden, inter, y);
       memcpy(&hidden_s[(size_t)t * hidden], y.data(), y.size() * 4);
+    }
     }
   }
   for (int i = 0; i < hidden; ++i) resid[(size_t)(T - 1) * hidden + i] += hidden_s[(size_t)(T - 1) * hidden + i];

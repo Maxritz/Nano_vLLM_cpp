@@ -59,6 +59,10 @@ int main() {
   const char* prompt = std::getenv("HIP_SEQ_PROMPT");
   if (!prompt) prompt = "The capital of France is";
   std::vector<int> ids = tok.encode_text(prompt);
+  if (const char* ti = std::getenv("HIP_SEQ_IDS")) {
+    ids.clear();
+    for (const char* p = ti; *p;) { ids.push_back(atoi(p)); while (*p && *p != ',') ++p; if (*p == ',') ++p; }
+  }
   if (std::getenv("HIP_SEQ_CHAT")) {
     const char* cp = prompt;
     if (!std::getenv("HIP_SEQ_PROMPT")) cp = "Write a Python function to reverse a string";
@@ -76,6 +80,12 @@ int main() {
       c.insert(c.end(), part.begin(), part.end());
     };
     if (im_start >= 0 && im_end >= 0) {
+      if (tok.chat_auto_system()) {
+        c.push_back(im_start);
+        append("system\nYou are a helpful assistant.");
+        c.push_back(im_end);
+        append("\n");
+      }
       c.push_back(im_start);
       append(std::string("user\n") + cp);
       c.push_back(im_end);

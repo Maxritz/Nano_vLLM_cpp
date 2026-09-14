@@ -150,6 +150,7 @@ static GenResult run_generation(LLMEngine& engine, const std::string& prompt, co
     (void)outs; (void)cnt;
     for (const auto& pr : news) {
       int tok = pr.second;
+      if (std::getenv("NV_PRINT_IDS")) std::fprintf(stderr, "%d ", tok);
       if (tok == eos) { res.finish = "stop"; return res; }
       std::string d = engine.decode_token(tok);
       ++res.completion_tokens;
@@ -274,7 +275,7 @@ static void handle_http(SOCKET c, LLMEngine& engine, const std::string& model_id
   }
 }
 
-static int run_server(const std::string& model_dir, int max_model_len, const std::string& host, int port) {
+static int run_server(const std::string& model_dir, int max_model_len, int num_kv_blocks, double expert_budget, const std::string& host, int port) {
 #ifdef _WIN32
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -282,7 +283,7 @@ static int run_server(const std::string& model_dir, int max_model_len, const std
     return 1;
   }
 #endif
-  LLMEngine engine(model_dir, max_model_len);
+  LLMEngine engine(model_dir, max_model_len, num_kv_blocks, expert_budget);
   std::string model_id = model_dir;
   if (!model_id.empty() && model_id.back() != '/' && model_id.back() != '\\') {
     size_t slash = model_id.find_last_of("/\\");
@@ -336,6 +337,8 @@ int main(int argc, char** argv) {
     std::string server_host = "127.0.0.1";
     int server_port = 8080;
     int bench_seqs = 4;
+    int num_kv_blocks = 0;  // 0 = size from max_model_len
+    double expert_budget = 0.0;  // 0 = auto (45% of free VRAM)
 
     for (size_t i = 0; i < args.size(); ++i) {
       const std::string& a = args[i];
@@ -343,6 +346,8 @@ int main(int argc, char** argv) {
       else if (a == "--max-tokens" && i + 1 < args.size()) max_tokens = std::stoi(args[++i]);
       else if (a == "--temperature" && i + 1 < args.size()) temperature = std::stod(args[++i]);
       else if (a == "--max-model-len" && i + 1 < args.size()) max_model_len = std::stoi(args[++i]);
+      else if (a == "--num-kv-blocks" && i + 1 < args.size()) num_kv_blocks = std::stoi(args[++i]);
+      else if (a == "--expert-budget" && i + 1 < args.size()) expert_budget = std::stod(args[++i]);
       else if (a == "--bench") bench = true;
       else if (a == "--chat") chat = true;
       else if (a == "--num-seqs" && i + 1 < args.size()) bench_seqs = std::stoi(args[++i]);
@@ -362,9 +367,9 @@ int main(int argc, char** argv) {
       usage(argv[0]);
       return 1;
     }
-    if (server_mode) return run_server(model_dir, max_model_len, server_host, server_port);
+    if (server_mode) return run_server(model_dir, max_model_len, num_kv_blocks, expert_budget, server_host, server_port);
 
-    LLMEngine engine(model_dir, max_model_len);
+    LLMEngine engine(model_dir, max_model_len, num_kv_blocks, expert_budget);
     size_t free_mem = 0, total_mem = 0;
     HIP_CHECK(hipMemGetInfo(&free_mem, &total_mem));
     std::fprintf(stderr, "VRAM after load: free %.1f GB / %.1f GB\n", free_mem / 1e9, total_mem / 1e9);

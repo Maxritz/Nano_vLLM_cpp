@@ -804,3 +804,137 @@ void hip_copy_from_host(const std::vector<float>& host, float* dev) {
   if (host.empty()) return;
   HIP_CHECK(hipMemcpy(dev, host.data(), host.size() * sizeof(float), hipMemcpyHostToDevice));
 }
+
+// ============================ MoE (Edge0 policy, native formats) =====================
+__device__ __forceinline__ double pr_max(double a, double b) { return a > b ? a : b; }
+
+// One block per token row: precise softmax in double (matches reference
+// select_from_logits), top-K selection sort, optional renormalize.
+__global__ void moe_route_kernel(const float* __restrict__ logits, int E, int K, int norm,
+                                 int32_t* __restrict__ idx, float* __restrict__ score) {
+  extern __shared__ double rsm[];
+  double* pr = rsm;
+  int* ix = (int*)(rsm + E);
+  int t = blockIdx.x;
+  if (threadIdx.x != 0) return;
+  const float* lg = logits + (int64_t)t * E;
+  double maxv = -1e300;
+  for (int i = 0; i < E; ++i) maxv = pr_max(maxv, (double)lg[i]);
+  double sum = 0.0;
+  for (int i = 0; i < E; ++i) { pr[i] = exp((double)lg[i] - maxv); sum += pr[i]; }
+  double inv = 1.0 / sum;
+  for (int i = 0; i < E; ++i) { pr[i] *= inv; ix[i] = i; }
+  for (int i = 0; i < K; ++i) {
+    int best = i;
+    for (int j = i + 1; j < E; ++j) if (pr[j] > pr[best]) best = j;
+    double tp = pr[i]; pr[i] = pr[best]; pr[best] = tp;
+    int ti = ix[i]; ix[i] = ix[best]; ix[best] = ti;
+    idx[(int64_t)t * K + i] = ix[i];
+    score[(int64_t)t * K + i] = (float)pr[i];
+  }
+  if (norm) {
+    double s = 0.0;
+    for (int i = 0; i < K; ++i) s += pr[i];
+    double sinv = 1.0 / s;
+    for (int i = 0; i < K; ++i) score[(int64_t)t * K + i] = (float)(pr[i] * sinv);
+  }
+}
+
+__device__ __forceinline__ float block_dot(const float* a, const uint16_t* b, int n, bool bf16,
+                                            float* red, int tid, int bd) {
+  float acc = 0.0f;
+  for (int i = tid; i < n; i += bd) acc += a[i] * wt_load(b[i], bf16);
+  __syncthreads();  // previous return-value read of red[0] completed
+  red[tid] = acc;
+  __syncthreads();
+  if (tid == 0) {
+    float s = 0.0f;
+    for (int i = 0; i < bd; ++i) s += red[i];
+    red[0] = s;
+  }
+  __syncthreads();
+  return red[0];
+}
+
+// One block per token: out[t] += sum_k w_k * MLP_{idx[t,k]}(x[t]).
+// gu slot layout: [2I, H] (gate rows then up rows), dn slot: [H, I].
+__global__ void moe_ffn_kernel(const float* __restrict__ x, const int32_t* __restrict__ idx,
+                               const float* __restrict__ score, const uint16_t* __restrict__ gu,
+                               const uint16_t* __restrict__ dn, const int32_t* __restrict__ slot_of,
+                               int H, int I, int K, bool bf16, float* __restrict__ out) {
+  extern __shared__ float sm[];
+  float* xs = sm;
+  float* ys = xs + H;
+  float* res = ys + I;
+  float* red = res + H;
+  int t = blockIdx.x, tid = threadIdx.x, bd = blockDim.x;
+  for (int i = tid; i < H; i += bd) { xs[i] = x[(int64_t)t * H + i]; res[i] = 0.0f; }
+  __syncthreads();
+  for (int k = 0; k < K; ++k) {
+    int e = idx[(int64_t)t * K + k];
+    float w = score[(int64_t)t * K + k];
+    if (w == 0.0f) continue;
+    int32_t slot = slot_of[e];
+    const uint16_t* g = gu + (int64_t)slot * 2 * I * H;
+    const uint16_t* d = dn + (int64_t)slot * H * I;
+    for (int j = 0; j < I; ++j) {
+      float gg = block_dot(xs, g + (int64_t)j * H, H, bf16, red, tid, bd);
+      float uu = block_dot(xs, g + (int64_t)(I + j) * H, H, bf16, red, tid, bd);
+      if (tid == 0) ys[j] = gg / (1.0f + expf(-gg)) * uu;
+    }
+    __syncthreads();
+    for (int o = 0; o < H; ++o) {
+      float v = block_dot(ys, d + (int64_t)o * I, I, bf16, red, tid, bd);
+      if (tid == 0) res[o] += w * v;
+    }
+    __syncthreads();
+  }
+  for (int i = tid; i < H; i += bd) out[(int64_t)t * H + i] += res[i];
+}
+
+void hip_moe_route(const float* logits, int rows, int E, int K, bool norm, int32_t* idx, float* score) {
+  if (rows == 0) return;
+  moe_route_kernel<<<rows, 32, (size_t)E * (sizeof(double) + sizeof(int))>>>(
+      logits, E, K, norm ? 1 : 0, idx, score);
+}
+
+void hip_moe_ffn(const float* x, const int32_t* idx, const float* score, const uint16_t* gu,
+                 const uint16_t* dn, const int32_t* slot_of, int rows, int H, int I, int K,
+                 bool bf16, float* out) {
+  if (rows == 0) return;
+  size_t smem = ((size_t)3 * H + I + 256) * sizeof(float);
+  static bool cfg_done = false;
+  if (!cfg_done) {
+    hipFuncSetAttribute((const void*)moe_ffn_kernel, hipFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+    cfg_done = true;
+  }
+  moe_ffn_kernel<<<rows, 256, smem>>>(x, idx, score, gu, dn, slot_of, H, I, K, bf16, out);
+}
+
+__global__ void add_inplace_kernel(float* __restrict__ dst, const float* __restrict__ src, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (; i < n; i += stride) dst[i] += src[i];
+}
+
+void hip_add_inplace(float* dst, const float* src, size_t n) {
+  if (n == 0) return;
+  add_inplace_kernel<<<256, 256>>>(dst, src, n);
+}
+
+// dst[t,c] *= sigmoid(s[t]) — Qwen2-MoE shared_expert_gate scaling.
+__global__ void scale_rows_sigmoid_kernel(float* __restrict__ dst, const float* __restrict__ s,
+                                          int cols, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (; i < n; i += stride) {
+    float g = s[i / cols];
+    dst[i] *= 1.0f / (1.0f + expf(-g));
+  }
+}
+
+void hip_scale_rows_sigmoid(float* dst, const float* s, int rows, int cols) {
+  if (rows == 0) return;
+  scale_rows_sigmoid_kernel<<<256, 256>>>(dst, s, cols, (size_t)rows * cols);
+}
+

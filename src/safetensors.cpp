@@ -121,3 +121,32 @@ bool SafetensorsLoader::load_u16(const std::string& name, std::vector<uint16_t>&
   bf16 = (tm.dtype == "BF16");
   return true;
 }
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+const uint8_t* SafetensorsLoader::mapped(const std::string& name, size_t& bytes_out, bool& native_f16) const {
+#ifdef _WIN32
+  auto it = meta_.find(name);
+  if (it == meta_.end()) return nullptr;
+  const TensorMeta& tm = it->second;
+  File& file = files_[tm.file_index];
+  if (!file.map) {
+    HANDLE h = CreateFileA(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot map " + file.path);
+    HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    void* v = m ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    CloseHandle(h);
+    if (!v) throw std::runtime_error("MapViewOfFile failed for " + file.path);
+    file.map = v;
+    file.map_owner = std::shared_ptr<void>(v, [m](void* p) { UnmapViewOfFile(p); CloseHandle(m); });
+  }
+  bytes_out = size_t(tm.end - tm.start);
+  native_f16 = (tm.dtype == "F16");
+  return static_cast<const uint8_t*>(file.map) + file.base + tm.start;
+#else
+  throw std::runtime_error("mapped(): Windows-only for now");
+#endif
+}

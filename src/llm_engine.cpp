@@ -9,9 +9,11 @@
 static std::string special_start() { return std::string("<") + '|' + "im_start|>"; }
 static std::string special_end() { return std::string("<") + '|' + "im_end|>"; }
 
-LLMEngine::LLMEngine(std::string model_path, int max_model_len) {
+LLMEngine::LLMEngine(std::string model_path, int max_model_len, int num_kv_blocks, double expert_budget_gb) {
   config_.model = std::move(model_path);
   config_.max_model_len = max_model_len;
+  config_.num_kvcache_blocks = num_kv_blocks;
+  config_.expert_budget_gb = expert_budget_gb;
   config_.load_hf_config();
   tokenizer_.set_fallback_vocab_size(config_.hf.vocab_size);
   tokenizer_.load(config_.model);
@@ -42,7 +44,13 @@ void LLMEngine::add_chat_request(const std::string& user_prompt, const SamplingP
     auto part = tokenizer_.encode_text(s);
     ids.insert(ids.end(), part.begin(), part.end());
   };
-if (im_start >= 0 && im_end >= 0) {
+  if (im_start >= 0 && im_end >= 0) {
+    if (tokenizer_.chat_auto_system()) {
+      ids.push_back(im_start);
+      append("system\nYou are a helpful assistant.");
+      ids.push_back(im_end);
+      append("\n");
+    }
     ids.push_back(im_start);
     append("user\n" + user_prompt);
     ids.push_back(im_end);

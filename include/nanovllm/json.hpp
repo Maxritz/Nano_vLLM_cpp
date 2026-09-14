@@ -19,6 +19,7 @@ struct Json {
   bool is_null() const { return type == Type::Null; }
   bool is_object() const { return type == Type::Object; }
   bool is_array() const { return type == Type::Array; }
+  bool is_string() const { return type == Type::String; }
   bool contains(const std::string& k) const { return is_object() && obj.find(k) != obj.end(); }
   const Json& at(const std::string& k) const {
     static Json null_json;

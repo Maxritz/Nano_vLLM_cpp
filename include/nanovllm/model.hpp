@@ -26,6 +26,31 @@ struct Matrix {
   bool is_q8 = false;
 };
 
+// Streaming MoE state for one sparse layer. Expert weights stay on disk
+// (mmap = sysmem page cache); a small per-layer set of VRAM slots holds the
+// hot experts, LRU-managed. Uploads are raw f16/bf16 slices, native format.
+struct MoeState {
+  int E = 0, K = 0, I = 0;
+  int slots = 0;
+  bool bf16 = false;
+  bool stacked = false;
+  Matrix router;              // [E, H] device
+  Matrix sh_gu, sh_dn;        // shared expert, device (empty if none)
+  Matrix sh_gate;             // [1, H] sigmoid-scales shared output (if present)
+  DeviceBuf<uint16_t> slot_gu; // [slots, 2I*H]
+  DeviceBuf<uint16_t> slot_dn; // [slots, H*I]
+  DevVec<int32_t> slot_of;    // [E] expert -> slot or -1 (use .d on device)
+  // Host-side sources (pointers into mmap'd shards, valid for model lifetime).
+  std::vector<const uint16_t*> f_g, f_u, f_d;  // per-expert [I*H], [I*H], [H*I]
+  const uint16_t* s_gu = nullptr;              // stacked [E, 2I, H]
+  const uint16_t* s_dn = nullptr;              // stacked [E, H, I]
+  std::vector<int32_t> h_slot_of, h_slot_exp;  // mirrors
+  std::vector<uint64_t> h_lru;
+  uint64_t clock = 0;
+  std::vector<uint16_t> stage;
+  int evictions = 0, loads = 0;
+};
+
 struct LayerWeights {
   Matrix qkv;         // [(num_heads+2*num_kv_heads)*head_dim, hidden]
   DevVec<float> qkv_bias;   // [(num_heads+2*num_kv_heads)*head_dim] or empty
@@ -36,7 +61,10 @@ struct LayerWeights {
   DevVec<float> post_ln;    // [hidden]
   DevVec<float> q_norm;     // [head_dim] or empty
   DevVec<float> k_norm;     // [head_dim] or empty
+  MoeState moe;       // non-empty for sparse layers
 };
+
+class WeightLoader;  // defined in model.cpp; must outlive load_weights (mmap views)
 
 class Qwen3Model {
  public:
@@ -44,6 +72,7 @@ class Qwen3Model {
   ~Qwen3Model();
 
   void load_weights();
+  void alloc_expert_slots();
   int allocate_kv_cache();
   int estimate_kv_cache_blocks() const;
 
@@ -70,4 +99,5 @@ class Qwen3Model {
   size_t kv_layer_stride_ = 0;
   bool tie_lm_head_ = true;
   bool ready_ = false;
+  std::unique_ptr<WeightLoader> loader_;
 };

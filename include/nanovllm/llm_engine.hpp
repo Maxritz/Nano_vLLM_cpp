@@ -19,7 +19,8 @@ struct GenerateOutput {
 
 class LLMEngine {
  public:
-  explicit LLMEngine(std::string model_path, int max_model_len = 4096);
+  explicit LLMEngine(std::string model_path, int max_model_len = 4096, int num_kv_blocks = 0,
+                     double expert_budget_gb = 0.0);
 
   void add_request(const std::string& prompt, const SamplingParams& sp);
   void add_request(const std::vector<int>& prompt, const SamplingParams& sp);

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -24,12 +25,21 @@ class SafetensorsLoader {
   std::vector<int64_t> shape(const std::string& name) const;
   bool load_float(const std::string& name, std::vector<float>& out) const;
   bool load_u16(const std::string& name, std::vector<uint16_t>& out, bool& bf16) const;
+  const TensorMeta* meta_of(const std::string& name) const {
+    auto it = meta_.find(name);
+    return it == meta_.end() ? nullptr : &it->second;
+  }
+  // Zero-copy read view of a tensor's raw on-disk bytes (mmap'd). Null if absent.
+  // bytes_out receives the tensor byte length; native_f16 reports F16 vs BF16.
+  const uint8_t* mapped(const std::string& name, size_t& bytes_out, bool& native_f16) const;
 
  private:
   struct File {
     std::string path;
     uint64_t base = 0;
+    mutable void* map = nullptr;  // whole-file view, created lazily
+    mutable std::shared_ptr<void> map_owner;
   };
-  std::vector<File> files_;
+  mutable std::vector<File> files_;
   std::map<std::string, TensorMeta> meta_;
 };

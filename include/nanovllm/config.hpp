@@ -33,6 +33,14 @@ struct HFConfig {
   std::string hidden_act = "silu";
   std::string model_type;
   std::string dtype = "bfloat16";
+  // MoE (Qwen2-5-MoE / Qwen3-MoE style). num_experts > 0 => sparse layers exist.
+  int num_experts = 0;
+  int num_experts_per_tok = 0;
+  int moe_intermediate_size = 0;
+  int shared_expert_intermediate_size = 0;
+  int decoder_sparse_step = 1;
+  bool norm_topk_prob = true;
+  bool layer_is_moe(int l) const { return num_experts > 0 && ((l + 1) % decoder_sparse_step == 0); }
 
   static HFConfig from_json(const Json& j) {
     HFConfig c;
@@ -52,6 +60,12 @@ struct HFConfig {
     if (j.contains("attention_bias")) c.attention_bias = j.at("attention_bias").as_bool();
     if (j.contains("tie_word_embeddings")) c.tie_word_embeddings = j.at("tie_word_embeddings").as_bool();
     if (j.contains("hidden_act")) c.hidden_act = j.at("hidden_act").as_string();
+    if (j.contains("num_experts")) c.num_experts = j.at("num_experts").as_int();
+    if (j.contains("num_experts_per_tok")) c.num_experts_per_tok = j.at("num_experts_per_tok").as_int();
+    if (j.contains("moe_intermediate_size")) c.moe_intermediate_size = j.at("moe_intermediate_size").as_int();
+    if (j.contains("shared_expert_intermediate_size")) c.shared_expert_intermediate_size = j.at("shared_expert_intermediate_size").as_int();
+    if (j.contains("decoder_sparse_step")) c.decoder_sparse_step = j.at("decoder_sparse_step").as_int();
+    if (j.contains("norm_topk_prob")) c.norm_topk_prob = j.at("norm_topk_prob").as_bool();
     if (j.contains("torch_dtype")) c.dtype = j.at("torch_dtype").as_string();
     if (j.contains("dtype")) c.dtype = j.at("dtype").as_string();
     if (j.contains("rope_scaling") && j.at("rope_scaling").is_object()) {
@@ -101,6 +115,7 @@ struct Config {
   int eos = -1;
   int kvcache_block_size = 256;
   int num_kvcache_blocks = -1;
+  double expert_budget_gb = 0.0;  // MoE hot-expert VRAM pool; 0 = auto (~50% of free after dense)
 
   HFConfig hf;
 

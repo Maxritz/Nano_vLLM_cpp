@@ -24,6 +24,17 @@ class WeightLoader {
   bool load_q8(const std::string& st_name, std::vector<uint8_t>& out) const;
   bool load_qk(const std::string& st_name, int kind, size_t n_elements, std::vector<uint8_t>& out) const;
   bool gguf_mode() const { return gg_; }
+  // Mapped (zero-copy) view of an F16/BF16 tensor; safetensors only.
+  const uint16_t* mapped_u16(const std::string& name, size_t& elems, bool& bf16) const {
+    if (!st_) throw std::runtime_error("mapped_u16 requires safetensors");
+    size_t bytes = 0;
+    bool f16 = false;
+    const uint8_t* p = st_loader_.mapped(name, bytes, f16);
+    if (!p) return nullptr;
+    elems = bytes / 2;
+    bf16 = !f16;
+    return reinterpret_cast<const uint16_t*>(p);
+  }
   // MoE weights would otherwise be silently ignored (garbage output). Fail loud.
   bool has_moe() const {
     auto names = st_ ? st_loader_.names() : gg_loader_.names();
@@ -221,6 +232,148 @@ static void concat_rows_u(std::vector<uint16_t>& dst, const std::vector<uint16_t
   dst.insert(dst.end(), c.begin(), c.end());
 }
 
+// ---- streaming MoE: load (mmap slices), slot pool, per-step placement ----
+static void upload_u16(DevVec<uint16_t>& dst, const std::vector<uint16_t>& src);
+static void load_moe_layer(WeightLoader& loader, const HFConfig& hf, LayerWeights& lw, int layer) {
+  std::string p = "model.layers." + std::to_string(layer) + ".mlp.";
+  auto& ms = lw.moe;
+  const int H = hf.hidden_size, E = hf.num_experts, K = hf.num_experts_per_tok, I = hf.moe_intermediate_size;
+  ms.E = E; ms.K = K; ms.I = I;
+  std::vector<uint16_t> rt;
+  bool bf16 = false;
+  if (!loader.load_u16(p + "gate.weight", rt, bf16) || rt.size() != (size_t)E * H)
+    throw std::runtime_error("missing/short router weights in " + p);
+  upload_u16(ms.router.f16, rt);
+  ms.router.bf16 = bf16;
+  ms.bf16 = bf16;
+  const int SI = hf.shared_expert_intermediate_size;
+  if (SI > 0) {
+    std::vector<uint16_t> g, u, d;
+    bool b1 = false, b2 = false, b3 = false;
+    if (!loader.load_u16(p + "shared_expert.gate_proj.weight", g, b1) ||
+        !loader.load_u16(p + "shared_expert.up_proj.weight", u, b2) ||
+        !loader.load_u16(p + "shared_expert.down_proj.weight", d, b3))
+      throw std::runtime_error("missing shared expert weights in " + p);
+    std::vector<uint16_t> gu;
+    gu.reserve(g.size() + u.size());
+    gu.insert(gu.end(), g.begin(), g.end());
+    gu.insert(gu.end(), u.begin(), u.end());
+    upload_u16(ms.sh_gu.f16, gu);
+    upload_u16(ms.sh_dn.f16, d);
+    ms.sh_gu.bf16 = b1 && b2;
+    ms.sh_dn.bf16 = b3;
+    std::vector<uint16_t> gt;
+    bool bg = false;
+    if (loader.load_u16(p + "shared_expert_gate.weight", gt, bg) && gt.size() == (size_t)H)
+      upload_u16(ms.sh_gate.f16, gt), ms.sh_gate.bf16 = bg;
+  }
+  ms.stacked = loader.contains(p + "experts.gate_up_proj") && loader.contains(p + "experts.down_proj");
+  size_t ne = 0;
+  bool b = false;
+  if (ms.stacked) {
+    ms.s_gu = loader.mapped_u16(p + "experts.gate_up_proj", ne, b);
+    if (ne != (size_t)E * 2 * I * H) throw std::runtime_error("unexpected gate_up_proj shape in " + p);
+    ms.s_dn = loader.mapped_u16(p + "experts.down_proj", ne, b);
+    if (ne != (size_t)E * H * I) throw std::runtime_error("unexpected down_proj shape in " + p);
+  } else {
+    ms.f_g.resize(E);
+    ms.f_u.resize(E);
+    ms.f_d.resize(E);
+    for (int e = 0; e < E; ++e) {
+      std::string pe = p + "experts." + std::to_string(e) + ".";
+      ms.f_g[e] = loader.mapped_u16(pe + "gate_proj.weight", ne, b);
+      if (!ms.f_g[e] || ne != (size_t)I * H) throw std::runtime_error("missing expert gate " + pe);
+      ms.f_u[e] = loader.mapped_u16(pe + "up_proj.weight", ne, b);
+      if (!ms.f_u[e] || ne != (size_t)I * H) throw std::runtime_error("missing expert up " + pe);
+      ms.f_d[e] = loader.mapped_u16(pe + "down_proj.weight", ne, b);
+      if (!ms.f_d[e] || ne != (size_t)H * I) throw std::runtime_error("missing expert down " + pe);
+    }
+  }
+}
+
+void Qwen3Model::alloc_expert_slots() {
+  auto& hf = config_.hf;
+  if (hf.num_experts <= 0) return;
+  int nl = 0;
+  for (int l = 0; l < hf.num_hidden_layers; ++l)
+    if (hf.layer_is_moe(l)) ++nl;
+  if (!nl) return;
+  const size_t per_expert = (size_t)3 * hf.moe_intermediate_size * hf.hidden_size * 2;
+  const size_t total = (size_t)nl * hf.num_experts * per_expert;
+  size_t free_b = 0, tot_b = 0;
+  HIP_CHECK(hipMemGetInfo(&free_b, &tot_b));
+  size_t budget = config_.expert_budget_gb > 0
+                      ? (size_t)(config_.expert_budget_gb * 1e9)
+                      : (size_t)(free_b * 0.45);
+  if (budget > total) budget = total;
+  int slots = (int)(budget / ((size_t)nl * per_expert));
+  if (slots < hf.num_experts_per_tok + 2) slots = hf.num_experts_per_tok + 2;
+  if (slots > hf.num_experts) slots = hf.num_experts;
+  for (auto& lw : layers_) {
+    auto& ms = lw.moe;
+    if (!ms.E) continue;
+    ms.slots = slots;
+    ms.slot_gu.alloc((size_t)slots * 2 * ms.I * hf.hidden_size);
+    ms.slot_dn.alloc((size_t)slots * ms.I * hf.hidden_size);
+    ms.h_slot_of.assign(ms.E, -1);
+    ms.h_slot_exp.assign(slots, -1);
+    ms.h_lru.assign(slots, 0);
+    ms.slot_of.assign(ms.h_slot_of);
+    ms.stage.resize((size_t)3 * ms.I * hf.hidden_size);
+  }
+  std::fprintf(stderr, "MoE: %d sparse layers, %d experts (top-%d), %d VRAM slots/layer, %.2f GB budget\n",
+               nl, hf.num_experts, hf.num_experts_per_tok, slots, budget / 1e9);
+}
+
+static void moe_place(MoeState& ms, const std::vector<int32_t>& h_idx, int hidden, int I) {
+  std::vector<int32_t> uniq = h_idx;
+  std::sort(uniq.begin(), uniq.end());
+  uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+  if ((int)uniq.size() > ms.slots)
+    throw std::runtime_error("moe_place: unique experts exceed slots (chunking invariant broken)");
+  const size_t gu_n = (size_t)2 * I * hidden, dn_n = (size_t)I * hidden;
+  bool dirty = false;
+  for (int32_t e : uniq) {
+    if (e < 0 || e >= ms.E) continue;
+    if (ms.h_slot_of[e] >= 0) {
+      ms.h_lru[ms.h_slot_of[e]] = ++ms.clock;
+      continue;
+    }
+    int slot = -1;
+    for (int s = 0; s < ms.slots; ++s)
+      if (ms.h_slot_exp[s] < 0) { slot = s; break; }
+    if (slot < 0) {
+      slot = 0;
+      for (int s = 1; s < ms.slots; ++s)
+        if (ms.h_lru[s] < ms.h_lru[slot]) slot = s;
+      ms.h_slot_of[ms.h_slot_exp[slot]] = -1;
+      ms.evictions++;
+    }
+    uint16_t* sg = ms.stage.data();
+    uint16_t* sd = sg + gu_n;
+    if (ms.stacked) {
+      std::memcpy(sg, ms.s_gu + (size_t)e * gu_n, gu_n * 2);
+      std::memcpy(sd, ms.s_dn + (size_t)e * dn_n, dn_n * 2);
+    } else {
+      std::memcpy(sg, ms.f_g[e], dn_n * 2);
+      std::memcpy(sg + dn_n, ms.f_u[e], dn_n * 2);
+      std::memcpy(sd, ms.f_d[e], dn_n * 2);
+    }
+    // ponytail: synchronous copies; pageable-async from the shared stage buffer raced.
+    // Ring buffer + hipStreamSynchronize if this shows up in decode profiles.
+    HIP_CHECK(hipMemcpy(ms.slot_gu.ptr() + (size_t)slot * gu_n, sg, gu_n * 2, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(ms.slot_dn.ptr() + (size_t)slot * dn_n, sd, dn_n * 2, hipMemcpyHostToDevice));
+    ms.h_slot_of[e] = slot;
+    ms.h_slot_exp[slot] = e;
+    ms.h_lru[slot] = ++ms.clock;
+    ms.loads++;
+    dirty = true;
+  }
+  if (dirty)
+    HIP_CHECK(hipMemcpy(ms.slot_of.d, ms.h_slot_of.data(), ms.h_slot_of.size() * sizeof(int32_t),
+                        hipMemcpyHostToDevice));
+}
+
 static void concat_rows_q8(std::vector<uint8_t>& dst, const std::vector<uint8_t>& a,
                            const std::vector<uint8_t>& b, const std::vector<uint8_t>& c) {
   dst.clear();
@@ -266,9 +419,11 @@ Qwen3Model::Qwen3Model(const Config& config) : config_(config) {
 Qwen3Model::~Qwen3Model() = default;
 
 void Qwen3Model::load_weights() {
-  WeightLoader loader;
+  loader_.reset(new WeightLoader());
+  WeightLoader& loader = *loader_;
   loader.load_model_dir(config_.model);
-  if (loader.has_moe()) throw std::runtime_error("MoE models are not supported by this dense engine");
+  if (loader.has_moe() && (loader.gguf_mode() || config_.hf.num_experts <= 0))
+    throw std::runtime_error("MoE weights present but layout unsupported (safetensors Qwen MoE only)");
   if (!loader.contains("model.embed_tokens.weight")) throw std::runtime_error("model.embed_tokens.weight not found");
 
   auto& hf = config_.hf;
@@ -347,7 +502,9 @@ void Qwen3Model::load_weights() {
 
     load_matrix(loader, p + ".self_attn.o_proj.weight", lw.o, true, size_t(hidden) * q_size_);
 
-    if (loader.contains(p + ".mlp.gate_up_proj.weight")) {
+    if (hf.num_experts > 0 && hf.layer_is_moe(layer)) {
+      load_moe_layer(loader, hf, lw, layer);
+    } else if (loader.contains(p + ".mlp.gate_up_proj.weight")) {
       load_matrix(loader, p + ".mlp.gate_up_proj.weight", lw.gate_up, true, size_t(2 * inter) * hidden);
     } else {
       std::vector<uint16_t> g_u, u_u;
@@ -400,7 +557,8 @@ void Qwen3Model::load_weights() {
       }
     }
 
-    load_matrix(loader, p + ".mlp.down_proj.weight", lw.down, true, size_t(hidden) * inter);
+    if (!(hf.num_experts > 0 && hf.layer_is_moe(layer)))
+      load_matrix(loader, p + ".mlp.down_proj.weight", lw.down, true, size_t(hidden) * inter);
 
     std::vector<float> ln_h(hidden, 1.0f);
     load_optional(loader, p + ".input_layernorm.weight", ln_h);
@@ -433,6 +591,7 @@ void Qwen3Model::load_weights() {
     }
   }
 
+  alloc_expert_slots();
   ready_ = true;
 }
 
@@ -444,6 +603,9 @@ int Qwen3Model::allocate_kv_cache() {
   num_blocks_ = num_blocks;
   config_.num_kvcache_blocks = num_blocks;
   kv_cache_.alloc(static_cast<size_t>(hf.num_hidden_layers) * 2 * kv_layer_stride_);
+  const size_t bpb = 2ull * hf.num_hidden_layers * block_size_ * kv_head_stride_ * sizeof(float);
+  std::fprintf(stderr, "KV pool: %d blocks x %.1f MB = %.2f GB (f32, bs=%d, ctx=%d)\n",
+               num_blocks, bpb / 1e6, num_blocks * bpb / 1e9, block_size_, config_.max_model_len);
   return num_blocks;
 }
 
@@ -456,7 +618,7 @@ int Qwen3Model::estimate_kv_cache_blocks() const {
   size_t usable = static_cast<size_t>(static_cast<double>(free_mem) * config_.gpu_memory_utilization);
   if (usable < bytes_per_block) return 0;
   int blocks = static_cast<int>(usable / bytes_per_block);
-  int max_needed = (config_.max_model_len + block_size_ - 1) / block_size_ + 64;
+  int max_needed = (config_.max_model_len + block_size_ - 1) / block_size_ + 4;
   return std::min(blocks, max_needed);
 }
 
@@ -584,9 +746,50 @@ std::vector<float> Qwen3Model::forward_logits(const Context& ctx) {
      matmul_dispatch(attn_dev.ptr(), lw.o, rows, hidden, q_size_, hidden_dev.ptr());
      hip_rms_norm_add(hidden_dev.ptr(), residual_dev.ptr(), lw.post_ln.d, norm_dev.ptr(), rows, hidden, eps);
 
-    matmul_dispatch(norm_dev.ptr(), lw.gate_up, rows, 2 * inter, hidden, gate_dev.ptr());
-    hip_silu_and_mul(gate_dev.ptr(), mlp_dev.ptr(), rows, inter);
-    matmul_dispatch(mlp_dev.ptr(), lw.down, rows, hidden, inter, hidden_dev.ptr());
+    if (lw.moe.E) {
+      auto& ms = lw.moe;
+      DeviceBuf<float> route_dev;
+      DeviceBuf<int32_t> idx_dev;
+      DeviceBuf<float> sc_dev;
+      route_dev.alloc((size_t)rows * ms.E);
+      idx_dev.alloc((size_t)rows * ms.K);
+      sc_dev.alloc((size_t)rows * ms.K);
+      matmul_dispatch(norm_dev.ptr(), ms.router, rows, ms.E, hidden, route_dev.ptr());
+      hip_moe_route(route_dev.ptr(), rows, ms.E, ms.K, hf.norm_topk_prob, idx_dev.ptr(), sc_dev.ptr());
+      std::vector<int32_t> h_idx((size_t)rows * ms.K);
+      HIP_CHECK(hipMemcpy(h_idx.data(), idx_dev.ptr(), h_idx.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+      const int SI = hf.shared_expert_intermediate_size;
+      if (SI > 0 && !std::getenv("MOE_NO_SHARED")) {
+        matmul_dispatch(norm_dev.ptr(), ms.sh_gu, rows, 2 * SI, hidden, gate_dev.ptr());
+        hip_silu_and_mul(gate_dev.ptr(), mlp_dev.ptr(), rows, SI);
+        matmul_dispatch(mlp_dev.ptr(), ms.sh_dn, rows, hidden, SI, hidden_dev.ptr());
+        if (ms.sh_gate.f16.d) {
+          DeviceBuf<float> shs;
+          shs.alloc(rows);
+          matmul_dispatch(norm_dev.ptr(), ms.sh_gate, rows, 1, hidden, shs.ptr());
+          hip_scale_rows_sigmoid(hidden_dev.ptr(), shs.ptr(), rows, hidden);
+        }
+      } else {
+        HIP_CHECK(hipMemsetAsync(hidden_dev.ptr(), 0, (size_t)rows * hidden * sizeof(float)));
+      }
+      // Chunk rows so one ffn launch never needs more unique experts than
+      // slots (in-step eviction would leave slot_of[e]=-1 -> OOB reads).
+      const int chunk = std::max(1, ms.slots / ms.K);
+      for (int r0 = 0; r0 < rows; r0 += chunk) {
+        int rc = std::min(chunk, rows - r0);
+        std::vector<int32_t> sub(h_idx.begin() + (size_t)r0 * ms.K,
+                                 h_idx.begin() + (size_t)(r0 + rc) * ms.K);
+        moe_place(ms, sub, hidden, ms.I);
+        hip_moe_ffn(norm_dev.ptr() + (size_t)r0 * hidden, idx_dev.ptr() + (size_t)r0 * ms.K,
+                    sc_dev.ptr() + (size_t)r0 * ms.K, ms.slot_gu.ptr(), ms.slot_dn.ptr(),
+                    ms.slot_of.d, rc, hidden, ms.I, ms.K, ms.bf16,
+                    hidden_dev.ptr() + (size_t)r0 * hidden);
+      }
+    } else {
+      matmul_dispatch(norm_dev.ptr(), lw.gate_up, rows, 2 * inter, hidden, gate_dev.ptr());
+      hip_silu_and_mul(gate_dev.ptr(), mlp_dev.ptr(), rows, inter);
+      matmul_dispatch(mlp_dev.ptr(), lw.down, rows, hidden, inter, hidden_dev.ptr());
+    }
   }
 
   hip_rms_norm_add(hidden_dev.ptr(), residual_dev.ptr(), final_norm_.d, norm_dev.ptr(), rows, hidden, eps);
