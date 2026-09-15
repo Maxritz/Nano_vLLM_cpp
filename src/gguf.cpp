@@ -17,7 +17,7 @@ enum GGUFType {
 enum GGMLType {
   M_F32 = 0, M_F16 = 1, M_Q4_0 = 2, M_Q4_1 = 3, M_Q5_0 = 6, M_Q5_1 = 7, M_Q8_0 = 8, M_Q8_1 = 9,
   M_Q2_K = 10, M_Q3_K = 11, M_Q4_K = 12, M_Q5_K = 13, M_Q6_K = 14, M_Q8_K = 15,
-  M_BF16 = 30,
+  M_BF16 = 30, M_IQ4_NL = 20, M_IQ4_XS = 23,
 };
 
 struct Reader {
@@ -69,6 +69,8 @@ std::string ggml_type_name(uint32_t t) {
     case M_Q5_K: return "Q5_K";
     case M_Q6_K: return "Q6_K";
     case M_Q8_K: return "Q8_K";
+    case M_IQ4_NL: return "IQ4_NL";
+    case M_IQ4_XS: return "IQ4_XS";
     default: return "UNKNOWN" + std::to_string(t);
   }
 }
@@ -301,6 +303,223 @@ size_t GGUFLoader::qk_block_bytes(int ggml_type) {
     case 14: return 210;  // Q6_K
     default: return 0;
   }
+}
+
+namespace {
+
+// Q5_0: [fp16 d][4B qh][32B qs(high nibbles in 2nd half)], 32 values.
+void dequant_q5_0_block(const uint8_t* blk, float* y) {
+  float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+  uint32_t qh = uint32_t(blk[2] | (blk[3] << 8) | (blk[4] << 16) | (blk[5] << 24));
+  for (int i = 0; i < 32; ++i) {
+    int ql = (i < 16) ? (blk[6 + i] & 0xF) : (blk[6 + i - 16] >> 4);
+    int q = (ql | (int((qh >> i) & 1u) << 4)) - 16;
+    y[i] = d * float(q);
+  }
+}
+
+// IQ4_NL: [fp16 d][16B qs, low nibble first], 32 values, non-linear grid.
+void dequant_iq4_nl_block(const uint8_t* blk, float* y) {
+  static const int8_t kgrid[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                   1, 13, 25, 38, 53, 69, 89, 113};
+  float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+  for (int i = 0; i < 32; ++i) {
+    int nib = (i < 16) ? (blk[2 + i] & 0xF) : (blk[2 + i - 16] >> 4);
+    y[i] = d * float(kgrid[nib]);
+  }
+}
+
+// Q3_K: [32B hmask][64B qs][12B scales][fp16 d], 256 values.
+void dequant_q3_k_block(const uint8_t* blk, float* y) {
+  const uint8_t* hmask = blk;
+  const uint8_t* qs = blk + 32;
+  const uint8_t* scales = blk + 96;
+  float d = fp16_to_float(uint16_t(blk[108] | (blk[109] << 8)));
+  float dl[16];
+  for (int j = 0; j < 16; ++j) {
+    int l = (j < 8) ? (scales[j] & 0xF) : ((scales[j - 8] >> 4) & 0xF);
+    int h = (scales[8 + (j & 3)] >> (2 * (j >> 2))) & 3;
+    dl[j] = d * float(int8_t(l | (h << 4)) - 32);
+  }
+  for (int i = 0; i < 256; ++i) {
+    int h2 = i >> 7, s2 = (i >> 5) & 3, b2 = i & 31;
+    int ql = (qs[h2 * 32 + b2] >> (s2 * 2)) & 3;
+    int qh = ((hmask[i & 31] >> (i >> 5)) & 1) ^ 1;
+    y[i] = dl[i >> 4] * float(ql - (qh << 2));
+  }
+}
+
+// Q4_0: [fp16 d][16B qs, low nibble first], 32 values, y = d*(q-8).
+void dequant_q4_0_block(const uint8_t* blk, float* y) {
+  float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+  for (int i = 0; i < 32; ++i) {
+    int nib = (i < 16) ? (blk[2 + i] & 0xF) : (blk[2 + i - 16] >> 4);
+    y[i] = d * float(nib - 8);
+  }
+}
+
+// Q4_1: [fp16 d][fp16 m][16B qs, low nibble first], 32 values, y = d*q+m.
+void dequant_q4_1_block(const uint8_t* blk, float* y) {
+  float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+  float m = fp16_to_float(uint16_t(blk[2] | (blk[3] << 8)));
+  for (int i = 0; i < 32; ++i) {
+    int nib = (i < 16) ? (blk[4 + i] & 0xF) : (blk[4 + i - 16] >> 4);
+    y[i] = d * float(nib) + m;
+  }
+}
+
+// IQ4_XS: [fp16 d][u16 scales_h][4B scales_l][128B qs], 256 values.
+// Group g (8 x 32 vals): scale = (sl | sh<<4)-32, qs via IQ4_NL grid.
+void dequant_iq4_xs_block(const uint8_t* blk, float* y) {
+  static const int8_t kgrid[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                   1, 13, 25, 38, 53, 69, 89, 113};
+  float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+  uint32_t h = uint32_t(blk[2] | (blk[3] << 8));
+  for (int g = 0; g < 8; ++g) {
+    int sl = (blk[4 + (g >> 1)] >> ((g & 1) * 4)) & 0xF;
+    int sh = (h >> (2 * g)) & 3;
+    float dl = d * float((sl | (sh << 4)) - 32);
+    for (int j = 0; j < 32; ++j) {
+      int b = (j < 16) ? blk[8 + g * 16 + j] : blk[8 + g * 16 + j - 16];
+      int nib = (j < 16) ? (b & 0xF) : (b >> 4);
+      y[g * 32 + j] = dl * float(kgrid[nib]);
+    }
+  }
+}
+
+// Q2_K: [16B scales][64B qs][fp16 d][fp16 dmin], 256 values.
+// Group g (16 x 16 vals): y = d*(s&15)*q - dmin*(s>>4).
+void dequant_q2_k_block(const uint8_t* blk, float* y) {
+  float d = fp16_to_float(uint16_t(blk[80] | (blk[81] << 8)));
+  float dmin = fp16_to_float(uint16_t(blk[82] | (blk[83] << 8)));
+  for (int g = 0; g < 16; ++g) {
+    float dl = d * float(blk[g] & 0xF);
+    float ml = dmin * float(blk[g] >> 4);
+    for (int j = 0; j < 16; ++j) {
+      int byte = (g >> 3) * 32 + (g & 1) * 16 + j;
+      int q = (blk[16 + byte] >> (((g >> 1) & 3) * 2)) & 3;
+      y[g * 16 + j] = dl * float(q) - ml;
+    }
+  }
+}
+
+// Q4_K: [fp16 d][fp16 dmin][12B scales][128B qs], 256 values (ggml layout:
+// group g covers 32 vals from bytes (g>>1)*32+kk, low nibble if g even).
+void dequant_q4_k_block(const uint8_t* blk, float* y) {
+  float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+  float dmin = fp16_to_float(uint16_t(blk[2] | (blk[3] << 8)));
+  for (int j = 0; j < 8; ++j) {
+    uint32_t sc, mn;
+    if (j < 4) {
+      sc = blk[4 + j] & 63;
+      mn = blk[4 + j + 4] & 63;
+    } else {
+      sc = (blk[4 + j + 4] & 0xF) | ((blk[4 + j - 4] >> 6) << 4);
+      mn = (blk[4 + j + 4] >> 4) | ((blk[4 + j] >> 6) << 4);
+    }
+    float d1 = d * float(sc), m1 = dmin * float(mn);
+    int base = (j >> 1) * 32, sh = (j & 1) * 4;
+    for (int kk = 0; kk < 32; ++kk) {
+      int q = (blk[16 + base + kk] >> sh) & 0xF;
+      y[j * 32 + kk] = d1 * float(q) - m1;
+    }
+  }
+}
+
+// Q6_K: [128B ql][64B qh][16 x int8 scales][fp16 d], 256 values
+// (same index math as WL::mat Q6_K in tools/ref_top5.cpp + qk_w_q6).
+void dequant_q6_k_block(const uint8_t* blk, float* y) {
+  float d = fp16_to_float(uint16_t(blk[208] | (blk[209] << 8)));
+  for (int half = 0; half < 2; ++half) {
+    const uint8_t* ql = blk + half * 64;
+    const uint8_t* qh = blk + 128 + half * 32;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192 + half * 8);
+    for (int l = 0; l < 32; ++l) {
+      int is = l >> 4;
+      int q1 = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+      int q2 = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+      int q3 = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+      int q4 = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+      y[half * 128 + l] = d * float(sc[is + 0]) * float(q1 - 32);
+      y[half * 128 + l + 32] = d * float(sc[is + 2]) * float(q2 - 32);
+      y[half * 128 + l + 64] = d * float(sc[is + 4]) * float(q3 - 32);
+      y[half * 128 + l + 96] = d * float(sc[is + 6]) * float(q4 - 32);
+    }
+  }
+}
+
+struct Kind { const char* dtype; size_t blk_bytes; size_t blk_vals; void (*deq)(const uint8_t*, float*); };
+static const Kind kUpcastKinds[] = {
+    {"Q5_0", 22, 32, dequant_q5_0_block},
+    {"IQ4_NL", 18, 32, dequant_iq4_nl_block},
+    {"Q3_K", 110, 256, dequant_q3_k_block},
+    {"Q4_0", 18, 32, dequant_q4_0_block},
+    {"Q4_1", 20, 32, dequant_q4_1_block},
+    {"IQ4_XS", 136, 256, dequant_iq4_xs_block},
+    {"Q2_K", 84, 256, dequant_q2_k_block},
+    {"Q4_K", 144, 256, dequant_q4_k_block},
+    {"Q6_K", 210, 256, dequant_q6_k_block},
+};
+
+const Kind* find_upcast_kind(const std::string& dtype) {
+  for (auto& c : kUpcastKinds)
+    if (dtype == c.dtype) return &c;
+  return nullptr;
+}
+
+}  // namespace
+
+bool GGUFLoader::load_upcast_f32(const std::string& name, std::vector<float>& out) const {
+  const GGUFTensorMeta* m = tensor(name);
+  if (!m) return false;
+  size_t n = 1;
+  for (int64_t d : m->shape) n *= static_cast<size_t>(d);
+  const Kind* k = find_upcast_kind(m->dtype);
+  if (!k || n % k->blk_vals != 0) return false;
+  std::vector<uint8_t> raw(n / k->blk_vals * k->blk_bytes);
+  read_tensor_data(*m, raw.data(), raw.size());
+  out.resize(n);
+  for (size_t b = 0; b < n / k->blk_vals; ++b)
+    k->deq(raw.data() + b * k->blk_bytes, out.data() + b * k->blk_vals);
+  return true;
+}
+
+size_t GGUFLoader::upcast_block_bytes(const std::string& dtype) {
+  const Kind* k = find_upcast_kind(dtype);
+  return k ? k->blk_bytes : 0;
+}
+
+size_t GGUFLoader::upcast_block_vals(const std::string& dtype) {
+  const Kind* k = find_upcast_kind(dtype);
+  return k ? k->blk_vals : 0;
+}
+
+bool GGUFLoader::dequant_block_f32(const std::string& dtype, const uint8_t* blk, float* y) {
+  const Kind* k = find_upcast_kind(dtype);
+  if (!k) return false;
+  k->deq(blk, y);
+  return true;
+}
+
+bool GGUFLoader::dequant_blocks_f16(const std::string& dtype, const uint8_t* raw,
+                                    size_t n_elements, uint16_t* y) {
+  const Kind* k = find_upcast_kind(dtype);
+  if (!k || n_elements % k->blk_vals != 0) return false;
+  std::vector<float> tmp(k->blk_vals);
+  for (size_t b = 0; b < n_elements / k->blk_vals; ++b) {
+    k->deq(raw + b * k->blk_bytes, tmp.data());
+    for (size_t i = 0; i < k->blk_vals; ++i)
+      y[b * k->blk_vals + i] = float_to_fp16(tmp[i]);
+  }
+  return true;
+}
+
+bool GGUFLoader::load_upcast_f16(const std::string& name, std::vector<uint16_t>& out) const {
+  std::vector<float> f;
+  if (!load_upcast_f32(name, f)) return false;
+  out.resize(f.size());
+  for (size_t i = 0; i < f.size(); ++i) out[i] = float_to_fp16(f[i]);
+  return true;
 }
 
 bool GGUFLoader::load_qk(const std::string& name, int ggml_type, size_t n_elements,

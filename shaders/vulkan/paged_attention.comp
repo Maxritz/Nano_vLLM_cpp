@@ -5,10 +5,12 @@
 #define MAX_HEAD_DIM 256
 #define ATTN_THREADS 64
 #define ATTN_CHUNK 64
+#define V_TILE_D 32
 #define MAX_DIM_PER_THREAD ((MAX_HEAD_DIM + ATTN_THREADS - 1) / ATTN_THREADS)
 layout(local_size_x = ATTN_THREADS) in;
 layout(push_constant) uniform PC {
     int tokens, q_heads, kv_heads, head_dim, block_size, max_blocks; float scale;
+    int sw_start; float attn_softcap;
 } pc;
 layout(std430, binding = 0) buffer BQ { float q[]; };
 layout(std430, binding = 1) buffer BOUT { float g_out[]; };
@@ -19,6 +21,7 @@ layout(std430, binding = 5) buffer BQKL { int32_t query_key_len[]; };
 layout(std430, binding = 6) buffer BBLOCKS { int32_t block_tables[]; };
 shared float q_sh[MAX_HEAD_DIM];
 shared float scores[ATTN_CHUNK];
+shared float v_tile[ATTN_CHUNK * V_TILE_D];
 uint kv_ptr(uint block_idx, int offset, int kv_head) {
     return (block_idx * uint(pc.block_size) + uint(offset)) * uint(pc.kv_heads) + uint(kv_head);
 }
@@ -44,12 +47,15 @@ void main() {
         float sc = -1e30f;
         if (int(t) < n) {
             int key_idx = key0 + int(t);
-            int block_idx = block_tables[uint(seq) * uint(pc.max_blocks) + uint(key_idx / pc.block_size)];
-            int offset = key_idx % pc.block_size;
-            uint kp = kv_ptr(uint(block_idx), offset, kv_head);
-            float dot = 0.0f;
-            for (int d = 0; d < pc.head_dim; ++d) dot += q_sh[d] * k_cache[kp*uint(pc.head_dim)+uint(d)];
-            sc = dot * pc.scale;
+            if (key_idx >= pc.sw_start) {
+                int block_idx = block_tables[uint(seq) * uint(pc.max_blocks) + uint(key_idx / pc.block_size)];
+                int offset = key_idx % pc.block_size;
+                uint kp = kv_ptr(uint(block_idx), offset, kv_head);
+                float dot = 0.0f;
+                for (int d = 0; d < pc.head_dim; ++d) dot += q_sh[d] * k_cache[kp*uint(pc.head_dim)+uint(d)];
+                sc = dot * pc.scale;
+                if (pc.attn_softcap > 0.0f) sc = tanh(sc / pc.attn_softcap) * pc.attn_softcap;
+            }
         }
         scores[t] = sc; barrier(); barrier();
         float chunk_m = -1e30f;
@@ -60,18 +66,31 @@ void main() {
         float m_scale = exp(m - new_m), chunk_scale = exp(chunk_m - new_m);
         s = s * m_scale + sum_e * chunk_scale;
         for (int a = 0; a < MAX_DIM_PER_THREAD; ++a) acc[a] *= m_scale;
-        for (int local = 0; local < MAX_DIM_PER_THREAD; ++local) {
-            int d = local * ATTN_THREADS + int(t);
-            if (d >= pc.head_dim) continue;
-            float val = 0.0f;
-            for (int j = 0; j < n; ++j) {
+        // V rows for this chunk are preloaded cooperatively into SLM once per
+        // 32-dim slice (each (j,d) read exactly once, coalesced). Per-dim math
+        // is unchanged: val still sums j=0..n-1 in order, acc updated once per
+        // dim, so the FP summation order is bit-identical to the direct loop.
+        for (int d0 = 0; d0 < pc.head_dim; d0 += V_TILE_D) {
+            int tile_w = pc.head_dim - d0;
+            if (tile_w > V_TILE_D) tile_w = V_TILE_D;
+            for (int idx = int(t); idx < n * tile_w; idx += ATTN_THREADS) {
+                int j = idx / tile_w;
+                int k = idx % tile_w;
                 int key_idx = key0 + j;
                 int block_idx = block_tables[uint(seq)*uint(pc.max_blocks) + uint(key_idx/pc.block_size)];
                 int offset = key_idx % pc.block_size;
                 uint vp = kv_ptr(uint(block_idx), offset, kv_head);
-                val += exp(scores[j] - chunk_m) * v_cache[vp*uint(pc.head_dim)+uint(d)];
+                v_tile[j*V_TILE_D + k] = v_cache[vp*uint(pc.head_dim)+uint(d0+k)];
             }
-            acc[local] += chunk_scale * val;
+            barrier();
+            for (int local = 0; local < MAX_DIM_PER_THREAD; ++local) {
+                int d = local * ATTN_THREADS + int(t);
+                if (d < d0 || d >= d0 + tile_w) continue;
+                float val = 0.0f;
+                for (int j = 0; j < n; ++j) val += exp(scores[j] - chunk_m) * v_tile[j*V_TILE_D + (d - d0)];
+                acc[local] += chunk_scale * val;
+            }
+            barrier();
         }
         m = new_m; barrier(); barrier();
     }

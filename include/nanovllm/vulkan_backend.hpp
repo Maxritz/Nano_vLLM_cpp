@@ -1,15 +1,17 @@
 #pragma once
 
 // Vulkan backend for nano-vllm. Mirrors the hip_ops / DevVec / Qwen3Model
-// surface, but backed by VAiT vkruntime (device-local allocator) + the GLSL
-// kernels in shaders/vulkan/*.comp (SPIR-V embedded in spv.h). Uses
+// surface, backed by the GLSL kernels in shaders/vulkan/*.comp (SPIR-V
+// embedded in spv.h) and a minimal device-local allocator. Uses
 // VK_KHR_push_descriptor so there is ZERO per-dispatch descriptor-pool churn
 // (this is what makes a many-op model forward feasible, unlike VAiT vkblas's
 // fixed 64-set pool which leaks one set per vkblas_qgemm_* call).
 //
-// Perf reference port: AMD RDNA2/3/4 detection (apiVersion>=1.4 || devID 0x7550)
-// and force-device-local-VRAM policy, matching vulkan-amd-rdna4-perf-fix.patch
-// (disable_host_visible_vidmem=true for AMD dGPUs).
+// Device extensions / features are enabled as available (shaderFloat16,
+// shaderInt8 via VK_KHR_shader_float16_int8; VK_EXT_scalar_block_layout;
+// VK_KHR_push_descriptor). Validation layers are best-effort via VK_LAYER_KHRONOS_validation.
+// AMD-specific perf detection (apiVersion>=1.4 || vendor 0x1002/0x1023) gates
+// future RDNA4-specific tuning; generic device selection is otherwise vendor-agnostic.
 
 #include <cstdint>
 #include <memory>
@@ -20,8 +22,20 @@
 
 #include "gguf.hpp"
 
-#include "vkruntime/vkruntime.h"
 #include "spv.h"
+
+// Minimal runtime state, replacing the VAiT vkruntime dependency. Holds device
+// handles and memory properties needed for buffer allocation / transfers.
+struct VkRT {
+    VkDevice device = VK_NULL_HANDLE;
+    VkPhysicalDevice physDev = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryProperties memProps{};
+    VkCommandPool xferPool = VK_NULL_HANDLE;
+    VkCommandBuffer xferCmd = VK_NULL_HANDLE;
+    VkFence xferFence = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t qfi = 0;
+};
 
 // Forward-declared handle types; backend owns the lifetime.
 struct VBuf {
@@ -35,7 +49,9 @@ struct VBuf {
   VBuf& operator=(VBuf&& o) noexcept;
   ~VBuf();
   void alloc(VkDeviceSize bytes, VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-  void upload(const void* host, VkDeviceSize bytes);
+   void upload(const void* host, VkDeviceSize bytes);
+   void upload_at(VkDeviceSize offset, const void* host, VkDeviceSize bytes);
+   void upload_at_async(VkDeviceSize offset, const void* host, VkDeviceSize bytes);
   void download(void* host, VkDeviceSize bytes) const;
   void free();
   uint32_t words() const; // for fp32 views
@@ -62,9 +78,11 @@ class VulkanBackend {
   VulkanBackend(const VulkanBackend&) = delete;
   VulkanBackend& operator=(const VulkanBackend&) = delete;
 
-  VkDevice device() const { return dev_; }
-  VkQueue queue() const { return q_; }
-  VkRuntime* rt() const { return rt_; }
+   VkDevice device() const { return dev_; }
+   VkPhysicalDevice physical_device() const { return pd_; }
+   VkPhysicalDeviceProperties props() const { return props_; }
+   VkQueue queue() const { return q_; }
+  VkRT* rt() const { return rt_; }
   uint32_t queue_family() const { return qfi_; }
   VkCommandBuffer cmd() const { return cmd_; }
   bool is_amd() const { return is_amd_; }
@@ -84,16 +102,39 @@ class VulkanBackend {
   void rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps);
   void rms_norm_add(VBuf& x, VBuf& residual, VBuf& w, VBuf& y, int rows, int hidden, float eps);
   void add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off = 0);
-  void silu_and_mul(VBuf& gup, VBuf& y, int rows, int inter);
+   void silu_and_mul(VBuf& gup, VBuf& y, int rows, int inter);
+   void scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols);
   void rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride);
   void store_kv(VBuf& key, VBuf& value, VBuf& k_cache, VBuf& v_cache, VBuf& slot_map,
                 int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
-  void paged_attention(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
-                       VBuf& block_tables, int tokens, int q_heads, int kv_heads, int head_dim,
-                       int block_size, int max_blocks, float scale, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
+   void paged_attention(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
+                        VBuf& block_tables, int tokens, int q_heads, int kv_heads, int head_dim,
+                        int block_size, int max_blocks, float scale, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
+   // Extended paged attention: sw_start masks keys with key_idx < sw_start
+   // (sliding window; 0 = disabled), attn_softcap applies tanh-softcap
+   // (0 = off). paged_attention() above forwards with (0, 0.0f).
+   void paged_attention_ex(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
+                           VBuf& block_tables, int tokens, int q_heads, int kv_heads, int head_dim,
+                           int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
+                           VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
   void embedding(VBuf& ids, VMatrix& w, VBuf& y, int tokens, int hidden);
   void embedding_qk(VBuf& ids, VBuf& wq, VBuf& y, int tokens, int hidden, int kind);
-  void gather_rows(VBuf& rows, VBuf& idx, VBuf& y, int cols, int total);
+   void gather_rows(VBuf& rows, VBuf& idx, VBuf& y, int cols, int total);
+
+   // MoE (mirrors hip_ops.hip moe_route/moe_ffn).
+   void moe_route(VBuf& logits, VBuf& idx, VBuf& score, int rows, int E, int K, bool norm);
+   void moe_route_sigmoid(VBuf& logits, VBuf& idx, VBuf& score, VBuf& bias,
+                          int rows, int E, int K, int n_group, int topk_group,
+                          bool norm, float routed_scaling, int bias_off);
+    void moe_ffn(VBuf& x, VBuf& idx, VBuf& score, VBuf& gu, VBuf& dn,
+                 VBuf& slot_of, VBuf& out, int rows, int H, int I, int K, bool bf16);
+    // Fused route+FFN (P2-4): single dispatch; experts accumulate into `out`
+    // (overwrite). Host still reads idx/score back for slot placement; on a
+    // slot miss it places then re-runs (see vulkan_model.cpp).
+    void moe_route_ffn(VBuf& x, VBuf& logits, VBuf& idx, VBuf& score, VBuf& gu, VBuf& dn,
+                       VBuf& slot_of, VBuf& out, int r0, int rows, int H, int I, int K, int E,
+                       bool bf16, bool norm);
+    void add_buf(VBuf& a, VBuf& b, int n);
 
   template <class T>
   VBuf make(const std::vector<T>& host, VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
@@ -108,27 +149,42 @@ class VulkanBackend {
 
  private:
   VulkanBackend(VkInstance inst, VkPhysicalDevice pd, VkPhysicalDeviceProperties props,
-                VkDevice dev, VkRuntime* rt, uint32_t qfi, bool is_amd, bool is_rdna4);
+                 VkDevice dev, VkRT* rt, uint32_t qfi, bool is_amd, bool is_rdna4);
   void ensure_pipeline(const char* spv_name);
   VkPipeline get_pipe(const char* name);
   struct BufBind { uint32_t binding; VkBuffer buffer; VkDeviceSize offset = 0; VkDeviceSize range = 0; };
+  // Specialization-constant pipeline variant (e.g. moe_ffn SPEC_H/SPEC_I so
+  // shared memory is sized to the model, not compile-time maxima). `key`
+  // must uniquely identify (name + spec values); pipelines are cached by key.
+  void ensure_pipeline_spec(const char* spv_name, const char* key,
+                            const VkSpecializationMapEntry* entries, uint32_t n_entries,
+                            const void* data, size_t data_size);
+  VkPipeline get_pipe_spec(const char* spv_name, const char* key,
+                           const VkSpecializationMapEntry* entries, uint32_t n_entries,
+                           const void* data, size_t data_size);
+  void dispatch_spec(const char* spv_name, const char* key,
+                     const VkSpecializationMapEntry* entries, uint32_t n_entries,
+                     const void* data, size_t data_size,
+                     const void* pc, size_t pc_size,
+                     const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
   void begin_if_needed();
   void storage_barrier();
   void dispatch(const char* name, const void* pc, size_t pc_size,
                 const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
+  void dispatch_bound(VkPipeline p, const void* pc, size_t pc_size,
+                      const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
   VkInstance inst_;
   VkPhysicalDevice pd_;
   VkPhysicalDeviceProperties props_;
-  VkDevice dev_;
-  VkRuntime* rt_;
+   VkDevice dev_;
+   VkRT* rt_;
   VkQueue q_;
   uint32_t qfi_;
   bool is_amd_, is_rdna4_;
   VkCommandPool pool_;
   VkCommandBuffer cmd_;
   VkFence fence_;
-  VkPipelineCache pcache_;
-  VkPipelineCacheHeaderVersion pcache_ver_;
+   VkPipelineCache pcache_;
   VkDescriptorSetLayout dset_layout_;
   VkPipelineLayout pipe_layout_;
   struct PipeEntry { VkPipeline pipe; };

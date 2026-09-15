@@ -1,0 +1,72 @@
+// MoE router: SIGMOID_GROUP selection (Llama-3.1-MoE / Bailing-V MoE).
+// Mirrors edge0 moe_math.h group_select_from_logits.
+// One block per token, 32 threads, only thread 0 active.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#define MAX_E 256
+layout(local_size_x = 32) in;
+layout(push_constant) uniform PC {
+    int rows, E, K;          // tokens, num_experts, top_k
+    int n_group, topk_group; // group selection params
+    int norm, bias_off;      // norm_topk_prob flag, expert_bias SSBO offset (-1 if none)
+    float routed_scaling;
+} pc;
+layout(std430, binding = 0) buffer BLOGITS { float logits[]; };
+layout(std430, binding = 1) buffer BIDX { int32_t idx[]; };
+layout(std430, binding = 2) buffer BSCORE { float score[]; };
+layout(std430, binding = 3) buffer BBIAS { float bias[]; };
+shared float sig[MAX_E];
+shared int surv[MAX_E];
+shared int tmp_i[MAX_E];
+shared float tmp_f[MAX_E];
+void main() {
+    if (gl_LocalInvocationIndex != 0u) return;
+    int t = int(gl_WorkGroupID.x);
+    if (t >= pc.rows) return;
+    int E = pc.E;
+    if (E > MAX_E || E <= 0) return;
+    int kg = pc.n_group, gsz = E / kg;
+    int base = t * E;
+    // Sigmoid scores
+    for (int i = 0; i < E; ++i) {
+        float b = 0.0f;
+        if (pc.bias_off >= 0) b = bias[pc.bias_off + i];
+        float l = logits[base + i] + b;
+        sig[i] = 1.0f / (1.0f + exp(-l));
+    }
+    // Group sums
+    for (int i = 0; i < kg; ++i) tmp_f[i] = 0.0f;
+    for (int i = 0; i < kg; ++i)
+        for (int j = 0; j < gsz; ++j)
+            tmp_f[i] += sig[i * gsz + j];
+    // Selection sort topk_group groups by descending group sum
+    for (int i = 0; i < kg; ++i) tmp_i[i] = i;
+    for (int i = 0; i < pc.topk_group; ++i) {
+        int best = i;
+        for (int j = i + 1; j < kg; ++j) if (tmp_f[tmp_i[j]] > tmp_f[tmp_i[best]]) best = j;
+        if (best != i) { int ti = tmp_i[i]; tmp_i[i] = tmp_i[best]; tmp_i[best] = ti; }
+    }
+    // Collect survivors from topk_group groups
+    int nsurv = 0;
+    for (int i = 0; i < pc.topk_group; ++i) {
+        int g = tmp_i[i];
+        for (int j = 0; j < gsz; ++j) surv[nsurv++] = g * gsz + j;
+    }
+    // Selection sort top-K within survivors by sigmoid score
+    for (int i = 0; i < pc.K && i < nsurv; ++i) {
+        int best = i;
+        for (int j = i + 1; j < nsurv; ++j) if (sig[surv[j]] > sig[surv[best]]) best = j;
+        if (best != i) { int ti = surv[i]; surv[i] = surv[best]; surv[best] = ti; }
+        idx[t * pc.K + i] = surv[i];
+        score[t * pc.K + i] = sig[surv[i]];
+    }
+    if (pc.norm != 0 && pc.K > 0) {
+        float s = 0.0f;
+        for (int i = 0; i < pc.K; ++i) s += sig[surv[i]];
+        float sinv = 1.0f / (s + 1e-20f);
+        for (int i = 0; i < pc.K; ++i) score[t * pc.K + i] = sig[surv[i]] * sinv * pc.routed_scaling;
+    } else {
+        for (int i = 0; i < pc.K; ++i) score[t * pc.K + i] = sig[surv[i]] * pc.routed_scaling;
+    }
+}

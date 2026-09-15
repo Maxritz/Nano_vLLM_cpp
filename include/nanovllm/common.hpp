@@ -1,7 +1,5 @@
 #pragma once
 
-#include <hip/hip_runtime.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +8,9 @@
 #include <string>
 #include <vector>
 
+#if __has_include(<hip/hip_runtime.h>)
+#include <hip/hip_runtime.h>
+#define NANOVLLM_USE_HIP 1
 #define HIP_CHECK(expr)                                                \
   do {                                                                 \
     hipError_t hip_check_err_ = (expr);                                \
@@ -20,6 +21,9 @@
       std::exit(1);                                                    \
     }                                                                  \
   } while (0)
+#else
+#define NANOVLLM_USE_HIP 0
+#endif
 
 inline float fp16_to_float(uint16_t h) {
   uint32_t sign = (uint32_t(h & 0x8000u)) << 16;
@@ -55,6 +59,38 @@ inline float bf16_to_float(uint16_t h) {
   std::memcpy(&out, &bits, sizeof(out));
   return out;
 }
+
+// Round-to-nearest-even float -> half, matching numpy astype(np.float16)
+// (overflow saturates to Inf). Used only by the GGUF host-upcast path.
+inline uint16_t float_to_fp16(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, sizeof(bits));
+  uint32_t sign = (bits >> 16) & 0x8000u;
+  int32_t exp = int32_t((bits >> 23) & 0xffu) - 127 + 15;
+  uint32_t mant = bits & 0x7fffffu;
+  if (exp >= 31) return uint16_t(sign | 0x7c00u);
+  if (exp <= 0) {
+    if (exp < -10) return uint16_t(sign);
+    mant |= 0x800000u;
+    uint32_t t = uint32_t(14 - exp);
+    uint32_t m = mant >> t;
+    uint32_t dropped = mant & ((t >= 32 ? 0xffffffffu : ((1u << t) - 1u)));
+    uint32_t half = 1u << (t - 1);
+    if (dropped > half || (dropped == half && (m & 1u))) ++m;
+    return uint16_t(sign | (m & 0x3ffu));
+  }
+  uint32_t m = mant >> 13;
+  uint32_t dropped = mant & 0x1fffu;
+  if (dropped > 0x1000u || (dropped == 0x1000u && (m & 1u))) {
+    if (++m == 0x400u) {
+      m = 0;
+      if (++exp >= 31) return uint16_t(sign | 0x7c00u);
+    }
+  }
+  return uint16_t(sign | (uint32_t(exp) << 10) | m);
+}
+
+#if NANOVLLM_USE_HIP
 
 template <class T>
 struct DevVec {
@@ -136,3 +172,5 @@ inline int64_t* malloc_device_i64(size_t n) {
   HIP_CHECK(hipMalloc(&p, n * sizeof(int64_t)));
   return p;
 }
+
+#endif  // NANOVLLM_USE_HIP

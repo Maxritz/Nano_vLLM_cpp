@@ -1,0 +1,131 @@
+// Fused MoE route + expert FFN: one dispatch per chunk instead of two.
+// Thread 0 does SOFTMAX_TOPK routing (mirrors moe_route.comp), broadcasts the
+// chosen idx/scores through shared memory, then all 256 threads run the expert
+// FFN (mirrors moe_ffn.comp) reading routing from shared. idx/score are ALSO
+// written to global buffers so the host can place missing experts; on a slot
+// miss the host re-runs this kernel after placing (see vulkan_model.cpp).
+// gu layout: [slots, 2*I, H] — gate rows [0..I) then up rows [I..2I), each [H]
+// dn layout: [slots, H, I]. Shared sizes via specialization constants.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(constant_id = 0) const int SPEC_H = 2048;
+layout(constant_id = 1) const int SPEC_I = 4096;
+layout(constant_id = 2) const int SPEC_K = 64;
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int r0, rows, H, I, K, E, bf16, norm; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BLOGITS { float logits[]; };
+layout(std430, binding = 2) buffer BIDX { int32_t idx[]; };
+layout(std430, binding = 3) buffer BSCORE { float score[]; };
+layout(std430, binding = 4) buffer BGU { uint16_t gu[]; };
+layout(std430, binding = 5) buffer BDN { uint16_t dn[]; };
+layout(std430, binding = 6) buffer BSLOT { int32_t slot_of[]; };
+layout(std430, binding = 7) buffer BOUT { float moe_out[]; };
+shared float rpr[256];
+shared int rix[256];
+shared int s_idx[SPEC_K];
+shared float s_sc[SPEC_K];
+shared float ys[SPEC_I];
+shared float res[SPEC_H];
+shared float red[256];
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint exp = (h >> 10) & 0x1fu;
+    uint mant = h & 0x3ffu;
+    uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else {
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
+    return bits;
+}
+uint bf16_to_float_u(uint h) { return h << 16; }
+float wt_load(uint16_t v, bool bf16) {
+    return uintBitsToFloat(bf16 ? bf16_to_float_u(uint(v)) : fp16_to_float_u(uint(v)));
+}
+void main() {
+    if (pc.H > SPEC_H || pc.I > SPEC_I || pc.K > SPEC_K) return;
+    int t = int(gl_WorkGroupID.x);
+    if (t >= pc.rows) return;
+    int tid = int(gl_LocalInvocationIndex);
+    int gt = pc.r0 + t;
+    if (tid == 0) {
+        int E = pc.E;
+        if (E > 256 || E <= 0) return;
+        int base = gt * E;
+        float maxv = -1e30f;
+        for (int i = 0; i < E; ++i) { float v = logits[base + i]; if (v > maxv) maxv = v; }
+        float sum = 0.0f;
+        for (int i = 0; i < E; ++i) { rpr[i] = exp(logits[base + i] - maxv); sum += rpr[i]; }
+        float inv = 1.0f / sum;
+        for (int i = 0; i < E; ++i) { rpr[i] *= inv; rix[i] = i; }
+        int K = pc.K;
+        for (int i = 0; i < K; ++i) {
+            int best = i;
+            for (int j = i + 1; j < E; ++j) if (rpr[j] > rpr[best]) best = j;
+            float tp = rpr[i]; rpr[i] = rpr[best]; rpr[best] = tp;
+            int ti = rix[i]; rix[i] = rix[best]; rix[best] = ti;
+            idx[gt * K + i] = rix[i];
+            s_idx[i] = rix[i];
+            s_sc[i] = rpr[i];
+        }
+        if (pc.norm != 0) {
+            float s = 0.0f;
+            for (int i = 0; i < K; ++i) s += rpr[i];
+            float sinv = 1.0f / s;
+            for (int i = 0; i < K; ++i) s_sc[i] = rpr[i] * sinv;
+        }
+        for (int i = 0; i < K; ++i) score[gt * K + i] = s_sc[i];
+    }
+    barrier();
+    int xt_off = gt * pc.H;
+    for (int i = tid; i < pc.H; i += 256) res[i] = 0.0f;
+    barrier();
+    bool bf = pc.bf16 != 0;
+    for (int k = 0; k < pc.K; ++k) {
+        int e = s_idx[k];
+        float w = s_sc[k];
+        if (w == 0.0f) continue;
+        int slot = slot_of[e];
+        if (slot < 0) continue;
+        uint gu_off = uint(slot) * uint(pc.I) * uint(pc.H);
+        uint dn_off = uint(slot) * uint(pc.H) * uint(pc.I);
+        for (int j = 0; j < pc.I; ++j) {
+            uint gate_row_off = gu_off + uint(j) * uint(pc.H);
+            uint up_row_off = gu_off + (uint(pc.I) + uint(j)) * uint(pc.H);
+            float g_acc = 0.0f, u_acc = 0.0f;
+            for (int h = tid; h < pc.H; h += 256) {
+                float xv = x[xt_off + h];
+                g_acc += xv * wt_load(gu[gate_row_off + uint(h)], bf);
+                u_acc += xv * wt_load(gu[up_row_off + uint(h)], bf);
+            }
+            red[tid] = g_acc;
+            barrier();
+            for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+            float gg = red[0];
+            red[tid] = u_acc;
+            barrier();
+            for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+            float uu = red[0];
+            if (tid == 0) ys[j] = gg / (1.0f + exp(-gg)) * uu;
+        }
+        barrier();
+        for (int o = 0; o < pc.H; ++o) {
+            uint down_row_off = dn_off + uint(o) * uint(pc.I);
+            float acc = 0.0f;
+            for (int j = tid; j < pc.I; j += 256) acc += ys[j] * wt_load(dn[down_row_off + uint(j)], bf);
+            red[tid] = acc;
+            barrier();
+            for (int s = 128; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; barrier(); }
+            if (tid == 0) res[o] += w * red[0];
+        }
+        barrier();
+    }
+    for (int i = tid; i < pc.H; i += 256) moe_out[xt_off + i] = res[i];
+}

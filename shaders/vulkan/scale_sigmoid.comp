@@ -1,0 +1,18 @@
+// Per-row sigmoid scale: x[row*cols+c] *= 1/(1+exp(-s[row])).
+// Mirrors hip_ops.hip scale_rows_sigmoid_kernel.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { int rows, cols; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BS { float s[]; };
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= uint(pc.rows)) return;
+    float g = s[row];
+    float scale = 1.0f / (1.0f + exp(-g));
+    uint t = gl_LocalInvocationIndex;
+    for (int c = int(t); c < pc.cols; c += 256) {
+        x[row * uint(pc.cols) + uint(c)] *= scale;
+    }
+}

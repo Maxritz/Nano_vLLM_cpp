@@ -207,6 +207,8 @@ struct WL {
         }
         return true;
       }
+      std::vector<float> up;
+      if (gg.load_upcast_f32(ggmap(n), up)) { out.swap(up); return true; }
     }
     std::vector<uint16_t> u;
     bool bf = false;

@@ -5,12 +5,16 @@
 // DevVec / hip_ops / common.hpp (HIP), so it compiles in a pure-C++ Vulkan target.
 // Weight loading reuses nano-vllm's host loaders (gguf.hpp / safetensors.hpp).
 
+#include <algorithm>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "config.hpp"
+#include "edge0/stream.h"
 #include "gguf.hpp"
 #include "safetensors.hpp"
 #include "vulkan_backend.hpp"
@@ -38,6 +42,33 @@ struct VLayerWeights {
     VBuf post_ln;       // [hidden]
     VBuf q_norm;        // [head_dim] or empty
     VBuf k_norm;        // [head_dim] or empty
+    struct VulkanMoeState {
+        int E = 0, K = 0, I = 0;
+        int slots = 0;
+        bool bf16 = false;
+        bool stacked = false;
+        int router_kind = 0;          // 0=SOFTMAX_TOPK (Qwen), 1=SIGMOID_GROUP (Llama/Bailing)
+        int n_group = 0, topk_group = 0;
+        float routed_scaling = 1.0f;
+        bool norm_topk = true;
+        VMatrix router;              // [E, H] device
+        VMatrix sh_gu, sh_dn;        // shared expert
+        VMatrix sh_gate;             // [1, H] sigmoid-gate (if present)
+        VMatrix ex_bias_f16;      // [E] expert bias as fp16 (SIGMOID_GROUP)
+        VBuf ex_bias;             // [E] expert bias as float (SIGMOID_GROUP)
+        VBuf slot_gu;  // [slots, 2I*H] device
+        VBuf slot_dn;  // [slots, I*H] device
+        VBuf slot_of;  // [E] device (slot index per expert)
+        // Host-side sources (pointers into mmap'd shards, valid for model lifetime).
+        std::vector<const uint16_t*> f_g, f_u, f_d;  // per-expert [I*H]
+        const uint16_t* s_gu = nullptr;  // stacked [E, 2I, H]
+        const uint16_t* s_dn = nullptr;  // stacked [E, H, I]
+        std::vector<int32_t> h_slot_of, h_slot_exp;  // mirrors
+        std::vector<uint64_t> h_lru;
+        uint64_t clock = 0;
+        std::vector<uint16_t> stage;
+        int evictions = 0, loads = 0;
+    } moe;
 };
 
 class VulkanModel {
@@ -46,6 +77,7 @@ public:
     ~VulkanModel();
 
     void load_weights();
+    void alloc_expert_slots();
     int allocate_kv_cache();
     int estimate_kv_cache_blocks() const;
 
@@ -96,4 +128,24 @@ private:
     bool load_qk(const std::string& st_name, int kind, size_t n_elements, std::vector<uint8_t>& out) const;
     bool load_optional(const std::string& st_name, std::vector<float>& out) const;
     void load_model_dir(const std::string& model_dir);
+    void prefetch_experts();
+    void do_prefetch_experts();  // host page-touch only; safe on a worker thread
+    std::future<void> prefetch_fut_;
+    mutable std::mutex prefetch_mu_;  // guards MoE slot mirrors vs prefetch worker
+    std::string moe_key_prefix(int layer) const;
+    void moe_place(VLayerWeights::VulkanMoeState& ms, int layer,
+                   const std::vector<int32_t>& h_idx, int hidden, int I);
+    e0::SharedExpertCache& expert_cache() { return expert_cache_; }
+    e0::PrefetchBuffer& prefetch_buf() { return prefetch_buf_; }
+    const std::vector<VLayerWeights>& layers() const { return layers_; }
+    const Config& config() const { return config_; }
+    VLayerWeights::VulkanMoeState* layer_moe(int l) {
+        auto it = std::find_if(layers_.begin(), layers_.end(),
+                               [](const VLayerWeights& lw) { return lw.moe.E > 0; });
+        return it == layers_.end() ? nullptr : &it->moe;
+    }
+private:
+    e0::SharedExpertCache expert_cache_;
+    e0::PrefetchBuffer prefetch_buf_;
+    std::string model_prefix_;  // "model." or "model.language_model."
 };

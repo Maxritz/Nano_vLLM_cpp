@@ -1,9 +1,131 @@
+#define NOMINMAX
 #include "nanovllm/vulkan_model.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+static void warm_pages(const uint8_t* data, size_t bytes) {
+    if (!data || bytes == 0) return;
+#ifdef _WIN32
+    HMODULE hKernel = GetModuleHandleA("kernel32.dll");
+    if (hKernel) {
+        using PrefetchFunc = void (*)(void*, size_t, unsigned);
+        if (auto fn = (PrefetchFunc)GetProcAddress(hKernel, "PrefetchVirtualMemory")) {
+            fn(const_cast<uint8_t*>(data), bytes, 2);
+            return;
+        }
+    }
+#endif
+    const size_t page = 4096;
+    for (size_t off = 0; off < bytes; off += page)
+        (void)data[off];
+}
+
+namespace {
+// GGUF-MoE quantized experts: stacked raw K-quant blocks per layer, kept
+// quantized on host; dequantized per expert into ms.stage at place time.
+// (VulkanMoeState has no quantized members and its header is owned elsewhere,
+// so layer blobs live here, keyed by layer; cleared on every load_weights.)
+struct GgufMoeQ {
+    std::string dtype;  // "Q4_K" / "Q6_K"
+    int kind = 0;       // ggml type id (12/14)
+    std::vector<uint8_t> gate, up, down;  // stacked [E, I, H] raw blocks
+};
+std::map<int, GgufMoeQ> g_gguf_moe;
+// GGUF MoE metadata (config.hpp fill_from_gguf reads dense fields only and is
+// owned elsewhere: MoE counts are parsed here, nowhere else).
+void apply_gguf_moe_meta(const GGUFLoader& g, HFConfig& hf) {
+    std::string arch;
+    if (!g.meta_str("general.architecture", arch) || arch.empty()) return;
+    uint32_t u = 0;
+    if (g.meta_u32(arch + ".expert_count", u)) hf.num_experts = static_cast<int>(u);
+    if (g.meta_u32(arch + ".expert_used_count", u)) hf.num_experts_per_tok = static_cast<int>(u);
+    if (g.meta_u32(arch + ".expert_feed_forward_length", u)) hf.moe_intermediate_size = static_cast<int>(u);
+    if (g.meta_u32(arch + ".expert_shared_feed_forward_length", u))
+        hf.shared_expert_intermediate_size = static_cast<int>(u);
+}
+}  // namespace
+
+void VulkanModel::moe_place(VLayerWeights::VulkanMoeState& ms, int layer,
+                            const std::vector<int32_t>& h_idx, int hidden, int I) {
+    std::lock_guard<std::mutex> lk(prefetch_mu_);
+    std::vector<int32_t> uniq = h_idx;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    if ((int)uniq.size() > ms.slots)
+        throw std::runtime_error("moe_place: unique experts exceed slots (chunking invariant broken)");
+    const size_t gu_n = (size_t)2 * I * hidden, dn_n = (size_t)I * hidden;
+    bool dirty = false;
+    for (int32_t e : uniq) {
+        if (e < 0 || e >= ms.E) continue;
+        if (ms.h_slot_of[e] >= 0) {
+            ms.h_lru[ms.h_slot_of[e]] = ++ms.clock;
+            expert_cache_.touch(layer, e, ++ms.clock);
+            continue;
+        }
+        // Check global cache: if pages are already warm, skip warm_pages
+        if (expert_cache_.get(layer, e) < 0) {
+            // Not in global cache — this is a new expert, warm pages
+        }
+        int slot = -1;
+        for (int s = 0; s < ms.slots; ++s)
+            if (ms.h_slot_exp[s] < 0) { slot = s; break; }
+        if (slot < 0) {
+            slot = 0;
+            for (int s = 1; s < ms.slots; ++s)
+                if (ms.h_lru[s] < ms.h_lru[slot]) slot = s;
+            ms.h_slot_of[ms.h_slot_exp[slot]] = -1;
+            expert_cache_.put(layer, ms.h_slot_exp[slot], -1, ++ms.clock);
+            ms.evictions++;
+        }
+        uint16_t* sg = ms.stage.data();
+        uint16_t* sd = sg + gu_n;
+        auto qit = g_gguf_moe.find(layer);
+        if (qit != g_gguf_moe.end()) {
+            // GGUF MoE: experts stay quantized; dequant per-expert into stage.
+            const GgufMoeQ& q = qit->second;
+            size_t nb = dn_n / GGUFLoader::upcast_block_vals(q.dtype);
+            size_t stride = nb * GGUFLoader::upcast_block_bytes(q.dtype);
+            warm_pages(q.gate.data() + (size_t)e * stride, stride);
+            if (!GGUFLoader::dequant_blocks_f16(q.dtype, q.gate.data() + (size_t)e * stride, dn_n, sg) ||
+                !GGUFLoader::dequant_blocks_f16(q.dtype, q.up.data() + (size_t)e * stride, dn_n, sg + dn_n) ||
+                !GGUFLoader::dequant_blocks_f16(q.dtype, q.down.data() + (size_t)e * stride, dn_n, sd))
+                throw std::runtime_error("moe_place: GGUF expert dequant failed");
+        } else if (ms.stacked) {
+            std::memcpy(sg, ms.s_gu + (size_t)e * gu_n, gu_n * 2);
+            warm_pages((const uint8_t*)(ms.s_dn + (size_t)e * dn_n), dn_n * sizeof(uint16_t));
+            std::memcpy(sd, ms.s_dn + (size_t)e * dn_n, dn_n * 2);
+        } else {
+            warm_pages((const uint8_t*)ms.f_g[e], dn_n * sizeof(uint16_t));
+            std::memcpy(sg, ms.f_g[e], dn_n * 2);
+            warm_pages((const uint8_t*)ms.f_u[e], dn_n * sizeof(uint16_t));
+            std::memcpy(sg + dn_n, ms.f_u[e], dn_n * 2);
+            warm_pages((const uint8_t*)ms.f_d[e], dn_n * sizeof(uint16_t));
+            std::memcpy(sd, ms.f_d[e], dn_n * 2);
+        }
+        // Async: transfer runs while the host places remaining experts; the
+        // submit_wait after the moe_ffn loop orders + reclaims them.
+        ms.slot_gu.upload_at_async((VkDeviceSize)slot * gu_n * sizeof(uint16_t), sg, (VkDeviceSize)(gu_n * sizeof(uint16_t)));
+        ms.slot_dn.upload_at_async((VkDeviceSize)slot * dn_n * sizeof(uint16_t), sd, (VkDeviceSize)(dn_n * sizeof(uint16_t)));
+        ms.h_slot_of[e] = slot;
+        ms.h_slot_exp[slot] = e;
+        ms.h_lru[slot] = ++ms.clock;
+        expert_cache_.put(layer, e, slot, ++ms.clock);
+        ms.loads++;
+        dirty = true;
+    }
+    if (dirty)
+        ms.slot_of.upload(ms.h_slot_of.data(),
+                          (VkDeviceSize)(ms.h_slot_of.size() * sizeof(int32_t)));
+}
 
 VulkanModel::VulkanModel(const Config& config) : config_(config) {
     config_.validate();
@@ -27,6 +149,18 @@ std::string VulkanModel::map_name(const std::string& n) {
     auto rep = [&](const std::string& a, const std::string& b) {
         size_t p = s.find(a); if (p != std::string::npos) s.replace(p, a.size(), b);
     };
+    // GGUF MoE (qwen2-style blk.* names, see mkmicro_moe_gguf.py) + nested prefix.
+    rep("model.language_model.layers.", "blk.");
+    rep("model.language_model.embed_tokens.weight", "token_embd.weight");
+    rep("model.language_model.norm.weight", "output_norm.weight");
+    rep(".mlp.gate.weight", ".ffn_gate_inp.weight");
+    rep(".mlp.experts.gate_exps.weight", ".ffn_gate_exps.weight");
+    rep(".mlp.experts.up_exps.weight", ".ffn_up_exps.weight");
+    rep(".mlp.experts.down_exps.weight", ".ffn_down_exps.weight");
+    rep(".mlp.shared_expert.gate_proj.weight", ".ffn_gate_shexp.weight");
+    rep(".mlp.shared_expert.up_proj.weight", ".ffn_up_shexp.weight");
+    rep(".mlp.shared_expert.down_proj.weight", ".ffn_down_shexp.weight");
+    rep(".mlp.shared_expert_gate.weight", ".ffn_shexp_gate.weight");
     rep("model.embed_tokens.weight", "token_embd.weight");
     rep(".self_attn.q_proj.weight", ".attn_q.weight");
     rep(".self_attn.k_proj.weight", ".attn_k.weight");
@@ -63,13 +197,43 @@ void VulkanModel::load_model_dir(const std::string& model_dir) {
     st_loader_.add_directory(model_dir); st_ = true; gguf_ = false;
 }
 bool VulkanModel::contains(const std::string& n) const { return st_ ? st_loader_.contains(n) : gg_loader_.contains(map_name(n)); }
+
+std::string VulkanModel::moe_key_prefix(int layer) const {
+    // Resolve the MLP key prefix for this layer. Handles:
+    //   Qwen3-MoE:        model.layers.N.mlp
+    //   Qwen3.5-MoE full: language_model.model.layers.N.mlp (or .mlp.switch_mlp)
+    //   Qwen3.5-MoE tiny: model.language_model.layers.N.mlp
+    //   Gemma/Llama MoE:  model.layers.N.mlp
+    // Uses mlp.gate.weight as probe so mixed-attention layers (linear_attn) work.
+    // GGUF MoE (qwen2-style blk.*): probe GGUF directly, return the HF spelling
+    // so downstream mp-relative names map back to blk.* via map_name.
+    if (gguf_ && gg_loader_.contains("blk." + std::to_string(layer) + ".ffn_gate_inp.weight"))
+        return "model.layers." + std::to_string(layer) + ".mlp";
+    std::string p = "model.layers." + std::to_string(layer);
+    if (contains(p + ".mlp.gate.weight")) return p + ".mlp";
+    p = "language_model.model.layers." + std::to_string(layer);
+    if (contains(p + ".mlp.gate.weight")) {
+        if (contains(p + ".mlp.switch_mlp.gate.weight")) return p + ".mlp.switch_mlp";
+        return p + ".mlp";
+    }
+    p = "model.language_model.layers." + std::to_string(layer);
+    if (contains(p + ".mlp.gate.weight")) {
+        if (contains(p + ".mlp.switch_mlp.gate.weight")) return p + ".mlp.switch_mlp";
+        return p + ".mlp";
+    }
+    return "model.layers." + std::to_string(layer) + ".mlp";
+}
 bool VulkanModel::load_float(const std::string& n, std::vector<float>& out) const {
     if (st_) return st_loader_.load_float(n, out);
     return gg_loader_.load_float(map_name(n), out);
 }
 bool VulkanModel::load_u16(const std::string& n, std::vector<uint16_t>& out, bool& bf16) const {
     if (st_) return st_loader_.load_u16(n, out, bf16);
-    return gg_loader_.load_u16(map_name(n), out, bf16);
+    if (gg_loader_.load_u16(map_name(n), out, bf16)) return true;
+    // Host upcast for quants with no GPU dequant kernel (Q5_0/IQ4_NL/Q3_K plus
+    // Q4_0/Q4_1/IQ4_XS/Q2_K/Q4_K/Q6_K, e.g. *_Q2_K files and GGUF MoE experts).
+    if (gg_loader_.load_upcast_f16(map_name(n), out)) { bf16 = false; return true; }
+    return false;
 }
 bool VulkanModel::load_q8(const std::string& n, std::vector<uint8_t>& out) const { return gguf_ && gg_loader_.load_q8_0(map_name(n), out); }
 bool VulkanModel::load_qk(const std::string& n, int kind, size_t n_elements,
@@ -120,21 +284,34 @@ void VulkanModel::load_matrix_host(const std::string& n, std::vector<uint16_t>& 
 
 void VulkanModel::load_weights() {
     load_model_dir(config_.model);
-    { // MoE weights would otherwise be silently ignored (garbage output). Fail loud.
-      auto names = st_ ? st_loader_.names() : gg_loader_.names();
-      for (auto& n : names)
-        if (n.find("exps") != std::string::npos || n.find(".experts.") != std::string::npos ||
-            n.find("gate_inp") != std::string::npos || n.find("shared_expert") != std::string::npos ||
-            n.find("moe") != std::string::npos)
-          throw std::runtime_error("MoE models are not supported by this dense engine");
+    g_gguf_moe.clear();
+    {
+       auto names = st_ ? st_loader_.names() : gg_loader_.names();
+       bool has_moe = false;
+       for (auto& n : names)
+         if (n.find("exps") != std::string::npos || n.find(".experts.") != std::string::npos ||
+             n.find("gate_inp") != std::string::npos || n.find("shared_expert") != std::string::npos ||
+             (n.find("moe") != std::string::npos && n.find("_norm") == std::string::npos)) {
+           has_moe = true; break;
+         }
+        auto& hf = config_.hf;
+        if (has_moe && gguf_)
+            apply_gguf_moe_meta(gg_loader_, config_.hf);  // MoE counts live in GGUF KV
+        if (has_moe && hf.num_experts <= 0)
+           throw std::runtime_error("MoE weights present but config has num_experts=0");
     }
-    if (!contains("model.embed_tokens.weight")) throw std::runtime_error("model.embed_tokens.weight not found");
+    if (!contains("model.embed_tokens.weight") && !contains("model.language_model.embed_tokens.weight"))
+        throw std::runtime_error("model.embed_tokens.weight not found");
+    model_prefix_ = contains("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
     auto& hf = config_.hf;
     int hidden = hf.hidden_size, inter = hf.intermediate_size;
-    load_matrix("model.embed_tokens.weight", embed_, true, size_t(hf.vocab_size) * hidden);
+    load_matrix(model_prefix_ + "embed_tokens.weight", embed_, true, size_t(hf.vocab_size) * hidden);
     for (int layer = 0; layer < hf.num_hidden_layers; ++layer) {
         auto& lw = layers_[layer];
-        std::string p = "model.layers." + std::to_string(layer);
+        std::string p = model_prefix_ + "layers." + std::to_string(layer);
+        bool has_attn = contains(p + ".self_attn.qkv_proj.weight") ||
+                        contains(p + ".self_attn.q_proj.weight");
+        if (has_attn) {
         if (contains(p + ".self_attn.qkv_proj.weight")) {
             load_matrix(p + ".self_attn.qkv_proj.weight", lw.qkv, true, size_t(qkv_size_) * hidden);
         } else {
@@ -170,14 +347,100 @@ void VulkanModel::load_weights() {
         }
         std::vector<float> qb,kb,vb;
         if (load_optional(p + ".self_attn.q_proj.bias", qb) &&
-            load_optional(p + ".self_attn.k_proj.bias", kb) &&
-            load_optional(p + ".self_attn.v_proj.bias", vb)) {
-            std::vector<float> b; b.insert(b.end(),qb.begin(),qb.end());
-            b.insert(b.end(),kb.begin(),kb.end()); b.insert(b.end(),vb.begin(),vb.end());
-            lw.qkv_bias = dev_->make(b);
-        }
+             load_optional(p + ".self_attn.k_proj.bias", kb) &&
+             load_optional(p + ".self_attn.v_proj.bias", vb)) {
+             std::vector<float> b; b.insert(b.end(),qb.begin(),qb.end());
+             b.insert(b.end(),kb.begin(),kb.end()); b.insert(b.end(),vb.begin(),vb.end());
+             lw.qkv_bias = dev_->make(b);
+         }
         load_matrix(p + ".self_attn.o_proj.weight", lw.o, true, size_t(hidden) * q_size_);
-        if (contains(p + ".mlp.gate_up_proj.weight")) {
+        }  // end has_attn
+        if (hf.num_experts > 0 && hf.layer_is_moe(layer)) {
+            auto& ms = lw.moe;
+            const int H = hidden, E = hf.num_experts, K = hf.num_experts_per_tok, I = hf.moe_intermediate_size;
+            ms.E = E; ms.K = K; ms.I = I;
+            ms.router_kind = hf.is_sigmoid_group() ? 1 : 0;
+            ms.n_group = hf.n_group; ms.topk_group = hf.topk_group;
+            ms.routed_scaling = hf.routed_scaling; ms.norm_topk = hf.norm_topk_prob;
+            std::vector<uint16_t> rt;
+            bool b = false;
+            std::string mp = moe_key_prefix(layer) + ".";
+            if (!load_u16(mp + "gate.weight", rt, b) || rt.size() != (size_t)E * H)
+                throw std::runtime_error("missing/short router weights for layer " + std::to_string(layer));
+            ms.router.f16 = dev_->make(rt); ms.router.bf16 = b; ms.bf16 = b;
+            const int SI = hf.shared_expert_intermediate_size;
+            if (SI > 0) {
+                std::vector<uint16_t> g, u, d; bool b1=false, b2=false, b3=false;
+                if (!load_u16(mp + "shared_expert.gate_proj.weight", g, b1) ||
+                    !load_u16(mp + "shared_expert.up_proj.weight", u, b2) ||
+                    !load_u16(mp + "shared_expert.down_proj.weight", d, b3))
+                    throw std::runtime_error("missing shared expert weights for layer " + std::to_string(layer));
+                std::vector<uint16_t> gu; gu.reserve(g.size()+u.size());
+                gu.insert(gu.end(), g.begin(), g.end()); gu.insert(gu.end(), u.begin(), u.end());
+                ms.sh_gu.f16 = dev_->make(gu); ms.sh_gu.bf16 = b1&&b2;
+                ms.sh_dn.f16 = dev_->make(d); ms.sh_dn.bf16 = b3;
+                std::vector<uint16_t> gt; bool bg=false;
+                if (load_u16(mp + "shared_expert_gate.weight", gt, bg) && (int)gt.size() == H) {
+                    ms.sh_gate.f16 = dev_->make(gt); ms.sh_gate.bf16 = bg;
+                }
+            }
+            ms.stacked = contains(mp + "experts.gate_up_proj") && contains(mp + "experts.down_proj");
+            if (gguf_ && !ms.stacked) {
+                // GGUF MoE: stacked Q4_K/Q6_K experts stay quantized on host;
+                // dequantized per expert into ms.stage at place time.
+                static const char* kProjs[3] = {
+                    "experts.gate_exps.weight", "experts.up_exps.weight", "experts.down_exps.weight"};
+                std::vector<std::vector<uint8_t>> raws(3);
+                GgufMoeQ qb;
+                for (int pi = 0; pi < 3; ++pi) {
+                    std::string hn = mp + kProjs[pi];
+                    const GGUFTensorMeta* tm = gg_loader_.tensor(map_name(hn));
+                    if (!tm) throw std::runtime_error("missing GGUF MoE experts tensor: " + hn);
+                    int kind = (tm->dtype == "Q4_K") ? 12 : (tm->dtype == "Q6_K") ? 14 : 0;
+                    if (!kind) throw std::runtime_error("unsupported GGUF MoE expert dtype " + tm->dtype);
+                    if (qb.kind && qb.kind != kind)
+                        throw std::runtime_error("mixed expert quant kinds in layer " + std::to_string(layer));
+                    qb.kind = kind;
+                    qb.dtype = tm->dtype;
+                    size_t need = (size_t)E * I * H;
+                    if (need % GGUFLoader::QK_K != 0)
+                        throw std::runtime_error("GGUF MoE expert size off super-block boundary");
+                    if (!load_qk(hn, kind, need, raws[pi]))
+                        throw std::runtime_error("short GGUF MoE experts tensor: " + hn);
+                }
+                qb.gate = std::move(raws[0]); qb.up = std::move(raws[1]); qb.down = std::move(raws[2]);
+                g_gguf_moe[layer] = std::move(qb);
+                ms.f_g.assign(E, nullptr); ms.f_u.assign(E, nullptr); ms.f_d.assign(E, nullptr);
+            } else if (ms.stacked) {
+                size_t ne = 0; bool nf = false;
+                const uint8_t* raw_gu = st_loader_.mapped(mp + "experts.gate_up_proj", ne, nf);
+                if (!raw_gu || ne != (size_t)E * 2 * I * H * sizeof(uint16_t)) throw std::runtime_error("bad stacked gate_up_proj for layer " + std::to_string(layer));
+                const uint8_t* raw_dn = st_loader_.mapped(mp + "experts.down_proj", ne, nf);
+                if (!raw_dn || ne != (size_t)E * H * I * sizeof(uint16_t)) throw std::runtime_error("bad stacked down_proj for layer " + std::to_string(layer));
+                ms.s_gu = reinterpret_cast<const uint16_t*>(raw_gu);
+                ms.s_dn = reinterpret_cast<const uint16_t*>(raw_dn);
+            } else {
+                ms.f_g.resize(E); ms.f_u.resize(E); ms.f_d.resize(E);
+                for (int e = 0; e < E; ++e) {
+                    std::string pe = mp + "experts." + std::to_string(e) + ".";
+                    size_t ne = 0; bool nf = false;
+                    ms.f_g[e] = reinterpret_cast<const uint16_t*>(st_loader_.mapped(pe + "gate_proj.weight", ne, nf));
+                    if (!ms.f_g[e] || ne != (size_t)I * H * sizeof(uint16_t)) throw std::runtime_error("missing expert gate " + pe);
+                    ms.f_u[e] = reinterpret_cast<const uint16_t*>(st_loader_.mapped(pe + "up_proj.weight", ne, nf));
+                    if (!ms.f_u[e] || ne != (size_t)I * H * sizeof(uint16_t)) throw std::runtime_error("missing expert up " + pe);
+                    ms.f_d[e] = reinterpret_cast<const uint16_t*>(st_loader_.mapped(pe + "down_proj.weight", ne, nf));
+                    if (!ms.f_d[e] || ne != (size_t)H * I * sizeof(uint16_t)) throw std::runtime_error("missing expert down " + pe);
+                }
+            }
+            if (ms.router_kind == 1) {
+                std::vector<float> eb;
+                if (load_optional(mp + "gate.expert_bias", eb) && (int)eb.size() == E) {
+                    ms.ex_bias = dev_->make(eb);
+                } else {
+                    ms.ex_bias = dev_->make(std::vector<float>(E, 0.0f));
+                }
+            }
+        } else if (contains(p + ".mlp.gate_up_proj.weight")) {
             load_matrix(p + ".mlp.gate_up_proj.weight", lw.gate_up, true, size_t(2 * inter) * hidden);
         } else {
             std::vector<uint16_t> g_u,u_u; bool gbf=false,ubf=false;
@@ -203,7 +466,8 @@ void VulkanModel::load_weights() {
                 upload_u16_block(f, lw.gate_up); lw.gate_up.bf16 = gbf && ubf;
             }
         }
-        load_matrix(p + ".mlp.down_proj.weight", lw.down, true, size_t(hidden) * inter);
+        if (!(hf.num_experts > 0 && hf.layer_is_moe(layer)))
+            load_matrix(p + ".mlp.down_proj.weight", lw.down, true, size_t(hidden) * inter);
     std::vector<float> ln(hidden, 1.0f);
     (void)load_optional(p + ".input_layernorm.weight", ln); lw.input_ln = dev_->make(ln);
     ln.assign(hidden, 1.0f);
@@ -214,13 +478,78 @@ void VulkanModel::load_weights() {
     }
     }
     std::vector<float> fn(hf.hidden_size, 1.0f);
-    (void)load_optional("model.norm.weight", fn);
+    load_optional(model_prefix_ + "norm.weight", fn);
     final_norm_ = dev_->make(fn);
     tie_lm_head_ = hf.tie_word_embeddings;
     if (!tie_lm_head_ && contains("lm_head.weight"))
         load_matrix("lm_head.weight", lm_head_, false, size_t(hf.vocab_size) * hidden);
     ready_ = true;
     dev_->submit_wait();
+}
+
+void VulkanModel::alloc_expert_slots() {
+    auto& hf = config_.hf;
+    if (hf.num_experts <= 0) return;
+    int nl = 0;
+    for (int l = 0; l < hf.num_hidden_layers; ++l)
+        if (hf.layer_is_moe(l)) ++nl;
+    if (!nl) return;
+    const size_t per_expert = (size_t)2 * hf.moe_intermediate_size * hf.hidden_size * sizeof(uint16_t);
+    const size_t total = (size_t)nl * hf.num_experts * per_expert;
+    size_t budget = config_.expert_budget_gb > 0 ? (size_t)(config_.expert_budget_gb * 1e9) : (size_t)(2.0 * 1e9);
+    if (budget > total) budget = total;
+    int slots = (int)(budget / ((size_t)nl * per_expert));
+    if (slots < hf.num_experts_per_tok + 2) slots = hf.num_experts_per_tok + 2;
+    if (slots > hf.num_experts) slots = hf.num_experts;
+    // Global cache: allow up to 2x per-layer slots across all layers (CPU page-cache budget).
+    expert_cache_ = e0::SharedExpertCache(std::max(slots * nl, slots * 2));
+    prefetch_buf_ = e0::PrefetchBuffer(std::max(48, slots * nl / 4));
+    for (auto& lw : layers_) {
+        auto& ms = lw.moe;
+        if (!ms.E) continue;
+        ms.slots = slots;
+        ms.slot_gu.alloc((VkDeviceSize)slots * 2 * ms.I * hf.hidden_size * sizeof(uint16_t));
+        ms.slot_dn.alloc((VkDeviceSize)slots * ms.I * hf.hidden_size * sizeof(uint16_t));
+        ms.h_slot_of.assign(ms.E, -1);
+        ms.h_slot_exp.assign(slots, -1);
+        ms.h_lru.assign(slots, 0);
+        ms.slot_of = dev_->make(ms.h_slot_of);
+        ms.stage.resize((size_t)3 * ms.I * hf.hidden_size);
+    }
+    std::fprintf(stderr, "MoE: %d sparse layers, %d experts (top-%d), %d VRAM slots/layer, %.2f GB budget\n",
+                 nl, hf.num_experts, hf.num_experts_per_tok, slots, budget / 1e9);
+}
+
+void VulkanModel::prefetch_experts() {
+    // Overlap with the NEXT forward call: wait for the previous prefetch (if any),
+    // then kick a new one on a worker. The future's destructor joins at model teardown.
+    if (prefetch_fut_.valid()) prefetch_fut_.wait();
+    if (config_.hf.num_experts <= 0) return;
+    prefetch_fut_ = std::async(std::launch::async, [this] { do_prefetch_experts(); });
+}
+
+void VulkanModel::do_prefetch_experts() {
+    auto& hf = config_.hf;
+    if (hf.num_experts <= 0) return;
+    std::lock_guard<std::mutex> lk(prefetch_mu_);
+    const size_t gu_bytes = (size_t)2 * hf.moe_intermediate_size * hf.hidden_size * sizeof(uint16_t);
+    const size_t dn_bytes = (size_t)hf.moe_intermediate_size * hf.hidden_size * sizeof(uint16_t);
+    for (int layer = 0; layer < hf.num_hidden_layers; ++layer) {
+        if (!hf.layer_is_moe(layer)) continue;
+        auto& ms = layers_[layer].moe;
+        if (!ms.E) continue;
+        for (int e = 0; e < ms.E; ++e) {
+            if (ms.h_slot_of[e] < 0) continue;
+            if (ms.stacked) {
+                warm_pages((const uint8_t*)(ms.s_gu + (size_t)e * 2 * ms.I * hf.hidden_size), gu_bytes);
+                warm_pages((const uint8_t*)(ms.s_dn + (size_t)e * ms.I * hf.hidden_size), dn_bytes);
+            } else {
+                if (ms.f_g[e]) warm_pages((const uint8_t*)ms.f_g[e], dn_bytes);
+                if (ms.f_u[e]) warm_pages((const uint8_t*)ms.f_u[e], dn_bytes);
+                if (ms.f_d[e]) warm_pages((const uint8_t*)ms.f_d[e], dn_bytes);
+            }
+        }
+    }
 }
 
 int VulkanModel::estimate_kv_cache_blocks() const {
@@ -276,8 +605,8 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
     k_dev.alloc((VkDeviceSize)rows * kv_size_ * F4);
     v_dev.alloc((VkDeviceSize)rows * kv_size_ * F4);
     attn_dev.alloc((VkDeviceSize)rows * q_size_ * F4);
-    gate_dev.alloc((VkDeviceSize)rows * 2 * inter * F4);
-    mlp_dev.alloc((VkDeviceSize)rows * inter * F4);
+    gate_dev.alloc((VkDeviceSize)rows * 2 * std::max(inter, hf.shared_expert_intermediate_size) * F4);
+    mlp_dev.alloc((VkDeviceSize)rows * std::max(inter, hf.shared_expert_intermediate_size) * F4);
     { std::vector<float> zeros((size_t)rows * hidden, 0.0f);  // HIP zeroes scratch at alloc; residual is read-before-write
       residual_dev.upload(zeros.data(), (VkDeviceSize)zeros.size() * F4); }
 
@@ -285,6 +614,7 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
     for (int layer = 0; layer < hf.num_hidden_layers; ++layer) {
         auto& lw = layers_[layer];
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.input_ln, norm_dev, rows, hidden, eps);
+        if (lw.qkv.f16.buffer || lw.qkv.q8.buffer) {
         dev_->matmul(norm_dev, lw.qkv, rows, q_size_, hidden, q_dev, 0u);
         dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, k_dev, (uint32_t)(q_size_ * hidden));
         dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, v_dev, (uint32_t)((q_size_ + kv_size_) * hidden));
@@ -304,11 +634,100 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
             dev_->paged_attention(q_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
                                   rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale, 0u, 0u);
         dev_->matmul(attn_dev, lw.o, rows, hidden, q_size_, hidden_dev);
+        }  // end has_attn
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.post_ln, norm_dev, rows, hidden, eps);
-        dev_->matmul(norm_dev, lw.gate_up, rows, 2 * inter, hidden, gate_dev);
-        dev_->silu_and_mul(gate_dev, mlp_dev, rows, inter);
-        dev_->matmul(mlp_dev, lw.down, rows, hidden, inter, hidden_dev);
+        if (lw.moe.E > 0) {
+            auto& ms = lw.moe;
+            const int H = hidden, E = ms.E, K = ms.K, I = ms.I;
+            VBuf route_dev, idx_dev, score_dev, shs_dev, exp_dev;
+            route_dev.alloc((VkDeviceSize)rows * E * F4);
+            idx_dev.alloc((VkDeviceSize)rows * K * sizeof(int32_t));
+            score_dev.alloc((VkDeviceSize)rows * K * F4);
+            dev_->matmul(norm_dev, ms.router, rows, E, H, route_dev);
+            // Fused route+FFN needs SOFTMAX_TOPK routing with bounded K/E; the
+            // fused kernel sizes shared idx/score by SPEC_K (sigmoid path and
+            // oversize shapes keep the classic two-dispatch path).
+            const bool use_fused =
+                ms.router_kind == 0 && K <= 64 && E <= 256 && !std::getenv("MOE_NO_FUSED");
+            std::vector<int32_t> h_idx;
+            if (!use_fused) {
+                if (ms.router_kind == 0) {
+                    dev_->moe_route(route_dev, idx_dev, score_dev, rows, E, K, ms.norm_topk);
+                } else {
+                    int bias_off = ms.ex_bias.nbytes ? 0 : -1;
+                    dev_->moe_route_sigmoid(route_dev, idx_dev, score_dev, ms.ex_bias,
+                                            rows, E, K, ms.n_group, ms.topk_group,
+                                            ms.norm_topk, ms.routed_scaling, bias_off);
+                }
+                // Host needs routing indices before placing experts: flush the queue first
+                // (original code read idx_dev back while the dispatch was still queued).
+                dev_->submit_wait();
+                h_idx.assign((size_t)rows * K, 0);
+                idx_dev.download(h_idx.data(), (VkDeviceSize)h_idx.size() * sizeof(int32_t));
+            }
+             const int SI = hf.shared_expert_intermediate_size;
+             if (SI > 0 && !std::getenv("MOE_NO_SHARED")) {
+                dev_->matmul(norm_dev, ms.sh_gu, rows, 2 * SI, H, gate_dev);
+                dev_->silu_and_mul(gate_dev, mlp_dev, rows, SI);
+                dev_->matmul(mlp_dev, ms.sh_dn, rows, H, SI, hidden_dev);
+                if (ms.sh_gate.f16.nbytes) {
+                    shs_dev.alloc((VkDeviceSize)rows * F4);
+                    dev_->matmul(norm_dev, ms.sh_gate, rows, 1, H, shs_dev);
+                    dev_->scale_sigmoid(hidden_dev, shs_dev, rows, H);
+                }
+            } else {
+                std::vector<float> zeros((size_t)rows * H, 0.0f);
+                hidden_dev.upload(zeros.data(), (VkDeviceSize)zeros.size() * F4);
+            }
+            const int chunk = std::max(1, ms.slots / K);
+            if (use_fused) {
+                exp_dev.alloc((VkDeviceSize)rows * H * F4);
+                bool have_idx = false;
+                for (int r0 = 0; r0 < rows; r0 += chunk) {
+                    int rc = std::min(chunk, rows - r0);
+                    // Optimistic: route+FFN against currently resident slots.
+                    dev_->moe_route_ffn(norm_dev, route_dev, idx_dev, score_dev,
+                                        ms.slot_gu, ms.slot_dn, ms.slot_of, exp_dev,
+                                        r0, rc, H, I, K, E, ms.bf16, ms.norm_topk);
+                    dev_->submit_wait();
+                    if (!have_idx) {
+                        // Routing is deterministic in logits: one readback serves
+                        // all chunks and any fixup re-runs.
+                        h_idx.assign((size_t)rows * K, 0);
+                        idx_dev.download(h_idx.data(), (VkDeviceSize)h_idx.size() * sizeof(int32_t));
+                        have_idx = true;
+                    }
+                    std::vector<int32_t> sub(h_idx.begin() + (size_t)r0 * K,
+                                             h_idx.begin() + (size_t)(r0 + rc) * K);
+                    bool miss = false;
+                    for (int32_t e : sub)
+                        if (e < 0 || e >= E || ms.h_slot_of[e] < 0) { miss = true; break; }
+                    if (miss) {
+                        moe_place(ms, layer, sub, H, I);
+                        dev_->moe_route_ffn(norm_dev, route_dev, idx_dev, score_dev,
+                                            ms.slot_gu, ms.slot_dn, ms.slot_of, exp_dev,
+                                            r0, rc, H, I, K, E, ms.bf16, ms.norm_topk);
+                    }
+                }
+                dev_->add_buf(hidden_dev, exp_dev, rows * H);
+            } else {
+                for (int r0 = 0; r0 < rows; r0 += chunk) {
+                    int rc = std::min(chunk, rows - r0);
+                    std::vector<int32_t> sub(h_idx.begin() + (size_t)r0 * K,
+                                             h_idx.begin() + (size_t)(r0 + rc) * K);
+                    moe_place(ms, layer, sub, H, I);
+                    dev_->moe_ffn(norm_dev, idx_dev, score_dev, ms.slot_gu, ms.slot_dn,
+                                  ms.slot_of, hidden_dev, rc, H, I, K, ms.bf16);
+                }
+            }
+            dev_->submit_wait();
+        } else {
+            dev_->matmul(norm_dev, lw.gate_up, rows, 2 * inter, hidden, gate_dev);
+            dev_->silu_and_mul(gate_dev, mlp_dev, rows, inter);
+            dev_->matmul(mlp_dev, lw.down, rows, hidden, inter, hidden_dev);
+        }
     }
+    prefetch_experts();
     dev_->rms_norm_add(hidden_dev, residual_dev, final_norm_, norm_dev, rows, hidden, eps);
     int out_rows = (int)ctx.last_indices.size();
     VBuf selected_dev; selected_dev.alloc((VkDeviceSize)out_rows * hidden * F4);

@@ -75,6 +75,18 @@ class GGUFLoader {
   static constexpr int QK_K = 256;
   bool load_qk(const std::string& name, int ggml_type, size_t n_elements,
                std::vector<uint8_t>& out) const;
+  // Host upcast for quant types with no GPU dequant kernel (Q5_0, IQ4_NL, Q3_K
+  // as found in *_Q2_K files; plus Q4_0, Q4_1, IQ4_XS, Q2_K and the K-quants
+  // Q4_K/Q6_K for the GGUF-MoE place path): dequantize on CPU. False otherwise.
+  bool load_upcast_f16(const std::string& name, std::vector<uint16_t>& out) const;
+  bool load_upcast_f32(const std::string& name, std::vector<float>& out) const;
+  // Raw-block helpers (same table; also used by the GGUF-MoE place path and
+  // test probes). upcast_* return 0 for unsupported dtypes.
+  static size_t upcast_block_bytes(const std::string& dtype);
+  static size_t upcast_block_vals(const std::string& dtype);
+  static bool dequant_block_f32(const std::string& dtype, const uint8_t* blk, float* y);
+  static bool dequant_blocks_f16(const std::string& dtype, const uint8_t* raw,
+                                 size_t n_elements, uint16_t* y);
 
  private:
   std::string path_;
