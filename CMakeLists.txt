@@ -106,7 +106,7 @@ target_compile_options(nanovllm_vulkan PRIVATE
         OUTPUT "${SPV_H}"
         COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.2 ${SHADERS}
         COMMAND ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/cmake/GenSpvHeader.cmake"
-        DEPENDS ${SHADERS} "[REPO-PATH]/src/vulkan_model.cpp"
+        DEPENDS ${SHADERS} "${CMAKE_SOURCE_DIR}/src/vulkan_model.cpp"
         COMMENT "Compiling GLSL shaders to SPIR-V and regenerating spv.h"
     )
   else()

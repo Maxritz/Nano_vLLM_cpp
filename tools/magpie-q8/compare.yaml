@@ -1,15 +1,15 @@
-kernels:
+﻿kernels:
   - id: matmul_q8_baseline
     type: hip
     source_files: ["baseline.hip"]
     compile_command: "hipcc -O2 --offload-arch=gfx1201 -o baseline.exe baseline.hip"
-    testcase_command: "[TMP]/magpie-q8/baseline.exe"
-    working_dir: "[TMP]/magpie-q8"
+    testcase_command: "${MAGPIE_WORK}/baseline.exe"
+    working_dir: "${MAGPIE_WORK}"
   - id: matmul_q8_gemv
     type: hip
     source_files: ["candidate_gemv.hip"]
     compile_command: "hipcc -O2 --offload-arch=gfx1201 -o candidate_gemv.exe candidate_gemv.hip"
-    testcase_command: "[TMP]/magpie-q8/candidate_gemv.exe"
-    working_dir: "[TMP]/magpie-q8"
+    testcase_command: "${MAGPIE_WORK}/candidate_gemv.exe"
+    working_dir: "${MAGPIE_WORK}"
 compile:
   enable_default_compile: true
