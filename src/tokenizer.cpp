@@ -737,8 +737,20 @@ std::vector<int> Tokenizer::encode_text(const std::string& text) const {
       if (special_here) break;
       ++j;
     }
-    for (const auto& piece : pretokenize(text.substr(i, j - i))) {
-      auto part = unigram_ ? encode_unigram(piece) : encode_piece(piece);
+    // SPM word-start rule: every word gets a meta-space prefix — the first piece of
+    // a text span does too (nothing carried its leading ' '), but only if the text
+    // before it did not already end in a space (else the space belongs to prev word).
+    auto pieces = pretokenize(text.substr(i, j - i));
+    bool need_meta = i == 0 || (j > 0 && j <= text.size() && text[j - 1] != ' ');
+    for (const auto& piece0 : pieces) {
+      const std::string* pp = &piece0;
+      std::string metaed;
+      if (unigram_ && need_meta && !piece0.empty() && piece0[0] != ' ') {
+        metaed = " " + piece0;
+        pp = &metaed;
+      }
+      need_meta = false;
+      auto part = unigram_ ? encode_unigram(*pp) : encode_piece(*pp);
       ids.insert(ids.end(), part.begin(), part.end());
     }
     i = j;

@@ -327,8 +327,38 @@ void VulkanModel::load_weights() {
                 f.insert(f.end(),k_q8.begin(),k_q8.end()); f.insert(f.end(),v_q8.begin(),v_q8.end());
                 upload_q8_block(f, lw.qkv);
             } else if (qkind||kkind||vkind) {
-                if (!(qkind && kkind && vkind))
-                    throw std::runtime_error("mixed K-quant/non-K-quant q/k/v unsupported");
+                if (!(qkind && kkind && vkind)) {
+                    // Mixed K-quant/non-K-quant: upcast every tensor to F16 host-side
+                    // (load_u16 covers Q2_K/Q4_K/Q6_K/etc via load_upcast_f16) and fuse.
+                    std::vector<uint16_t> f;
+                    auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u) {
+                        if (u.empty()) { bool b = false;
+                            if (!load_u16(n, u, b) || u.empty())
+                                throw std::runtime_error("mixed-precision q/k/v needs F16 for " + n); }
+                        f.insert(f.end(), u.begin(), u.end());
+                    };
+                    fuse_u16(p + ".self_attn.q_proj.weight", q_u);
+                    fuse_u16(p + ".self_attn.k_proj.weight", k_u);
+                    fuse_u16(p + ".self_attn.v_proj.weight", v_u);
+                    if (std::getenv("NANO_PIPE") && layer == 0) {
+                      auto hf16=[](uint16_t h){uint32_t sign=(h>>15)&1,e=(h>>10)&0x1f,m=h&0x3ff;float val;
+                        if(e==0)val=(float)m/16777216.0f*(sign?-1.f:1.f);
+                        else if(e==31)val=m?NAN:(sign?-INFINITY:INFINITY);
+                        else{uint32_t z=((sign?1u:0u)<<31)|((e+127-15)<<23)|(m<<13);std::memcpy(&val,&z,4);}return val;};
+                      size_t vs=(size_t)kv_size_*hidden; double vsum=0; for(uint16_t h:v_u) vsum+=hf16(h);
+                      auto bs=[&](int bi){double s=0;for(int i=0;i<256;i++)s+=hf16(v_u[(size_t)bi*256+i]);return s;};
+                      double qbs=0; for(int i=0;i<256;i++)qbs+=hf16(q_u[i]);
+                      std::fprintf(stderr,"[PIPE load0 vsum=%.4f b0=%.4f b1=%.4f b2=%.4f b1023=%.4f b2047=%.4f\n",
+                        vsum, bs(0), bs(1), bs(2), bs(1023), bs(2047));
+                      std::fprintf(stderr,"[PIPE loadq q_u n=%zu qfirst=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f qblk0=%.4f\n",
+                        q_u.size(),(double)hf16(q_u[0]),(double)hf16(q_u[1]),(double)hf16(q_u[2]),
+                        (double)hf16(q_u[3]),(double)hf16(q_u[4]),(double)hf16(q_u[5]),qbs);
+                      { std::vector<uint8_t> rb; if(load_qk(p+".self_attn.v_proj.weight",12,vs,rb)) {
+                          std::fprintf(stderr,"[PIPE raw2 "); for(int i=0;i<16;i++)std::fprintf(stderr,"%02x ",rb[2*144+i]);
+                          std::fprintf(stderr,"] d=%.6f dmin=%.6f\n",(double)hf16((uint16_t)(rb[2*144]|(rb[2*144+1]<<8))),(double)hf16((uint16_t)(rb[2*144+2]|(rb[2*144+3]<<8)))); } }
+                    }
+                    upload_u16_block(f, lw.qkv);
+                } else {
                 size_t qe = size_t(q_size_)*hidden, ke = size_t(kv_size_)*hidden;
                 if (qe%256 || ke%256)
                     throw std::runtime_error("K-quant q/k/v split off super-block boundary");
@@ -339,6 +369,7 @@ void VulkanModel::load_weights() {
                  f.insert(f.end(),k_qk.begin(),k_qk.end()); f.insert(f.end(),v_qk.begin(),v_qk.end());
                   upload_qk_block(f, qkind, lw.qkv);
                   lw.qkv.qk_segs = {{qkind,0,0},{kkind,qb,qe},{vkind,qb+kb,qe+ke}};
+                }
             } else {
                 std::vector<uint16_t> f; f.insert(f.end(),q_u.begin(),q_u.end());
                 f.insert(f.end(),k_u.begin(),k_u.end()); f.insert(f.end(),v_u.begin(),v_u.end());
@@ -453,14 +484,25 @@ void VulkanModel::load_weights() {
                 std::vector<uint8_t> f; f.insert(f.end(),g_q8.begin(),g_q8.end()); f.insert(f.end(),u_q8.begin(),u_q8.end());
                 upload_q8_block(f, lw.gate_up);
             } else if (gkind||ukind) {
-                if (!(gkind && gkind==ukind))
-                    throw std::runtime_error("mixed K-quant gate/up needs split dispatch (unsupported)");
+                if (!(gkind && ukind && gkind==ukind)) {
+                    std::vector<uint16_t> f;
+                    auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u) {
+                        if (u.empty()) { bool b = false;
+                            if (!load_u16(n, u, b) || u.empty())
+                                throw std::runtime_error("mixed-precision gate/up needs F16 for " + n); }
+                        f.insert(f.end(), u.begin(), u.end());
+                    };
+                    fuse_u16(p + ".mlp.gate_proj.weight", g_u);
+                    fuse_u16(p + ".mlp.up_proj.weight", u_u);
+                    upload_u16_block(f, lw.gate_up);
+                } else {
                 if ((size_t(inter)*hidden)%256)
                     throw std::runtime_error("K-quant gate/up split off super-block boundary");
                 size_t gb = size_t(inter)*hidden/256*GGUFLoader::qk_block_bytes(gkind);
                 std::vector<uint8_t> f; f.insert(f.end(),g_qk.begin(),g_qk.end()); f.insert(f.end(),u_qk.begin(),u_qk.end());
                 upload_qk_block(f, gkind, lw.gate_up);
                 lw.gate_up.qk_segs = {{gkind,0,0},{ukind,gb,size_t(inter)*hidden}};
+                }
             } else {
                 std::vector<uint16_t> f; f.insert(f.end(),g_u.begin(),g_u.end()); f.insert(f.end(),u_u.begin(),u_u.end());
                 upload_u16_block(f, lw.gate_up); lw.gate_up.bf16 = gbf && ubf;
@@ -610,7 +652,18 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
     { std::vector<float> zeros((size_t)rows * hidden, 0.0f);  // HIP zeroes scratch at alloc; residual is read-before-write
       residual_dev.upload(zeros.data(), (VkDeviceSize)zeros.size() * F4); }
 
+    const bool pipe_dbg = std::getenv("NANO_PIPE") != nullptr;
+    auto pipe_tag = [&](const char* stage, const VBuf& b, size_t floats) {
+        if (!pipe_dbg) return;
+        dev_->submit_wait();
+        std::vector<float> v(std::min<size_t>(floats, (size_t)rows * hidden));
+        b.download(v.data(), v.size() * F4);
+        double sum = 0.0; for (float x : v) sum += x;
+        std::fprintf(stderr, "[PIPE vk %s] n=%zu sum=%.6f first=%.6f,%.6f,%.6f\n",
+                     stage, v.size(), sum, v[0], v[1], v[2]);
+    };
     dev_->embedding(d_ids, embed_, hidden_dev, rows, hidden);
+    pipe_tag("embed", hidden_dev, (size_t)rows * hidden);
     for (int layer = 0; layer < hf.num_hidden_layers; ++layer) {
         auto& lw = layers_[layer];
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.input_ln, norm_dev, rows, hidden, eps);
@@ -625,15 +678,19 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
         }
         if (lw.q_norm.nbytes) dev_->rms_norm(q_dev, lw.q_norm, q_dev, rows * heads, head_dim, eps);
         if (lw.k_norm.nbytes) dev_->rms_norm(k_dev, lw.k_norm, k_dev, rows * kv_heads, head_dim, eps);
+        if (layer == 0) { pipe_tag("L0.q", q_dev, (size_t)rows * q_size_); pipe_tag("L0.k", k_dev, (size_t)rows * kv_size_); pipe_tag("L0.v", v_dev, (size_t)rows * kv_size_); }
         dev_->rope(q_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_);
         dev_->rope(k_dev, d_pos, inv_freq_, rows, kv_heads, head_dim, kv_size_);
+        if (layer == 0) { pipe_tag("L0.qrope", q_dev, (size_t)rows * q_size_); pipe_tag("L0.krope", k_dev, (size_t)rows * kv_size_); }
         int d = kv_heads * head_dim;
         if (d_slot.buffer && !ctx.slot_mapping.empty())
             dev_->store_kv(k_dev, v_dev, k_cache_[layer], v_cache_[layer], d_slot, kv_heads, head_dim, rows * d, 0u, 0u);
         if (d_qseq.buffer && !ctx.query_seq.empty())
             dev_->paged_attention(q_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
                                   rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale, 0u, 0u);
+        if (layer == 0) pipe_tag("L0.attn", attn_dev, (size_t)rows * q_size_);
         dev_->matmul(attn_dev, lw.o, rows, hidden, q_size_, hidden_dev);
+        pipe_tag(("L" + std::to_string(layer) + ".attnout").c_str(), hidden_dev, (size_t)rows * hidden);
         }  // end has_attn
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.post_ln, norm_dev, rows, hidden, eps);
         if (lw.moe.E > 0) {
@@ -726,6 +783,7 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
             dev_->silu_and_mul(gate_dev, mlp_dev, rows, inter);
             dev_->matmul(mlp_dev, lw.down, rows, hidden, inter, hidden_dev);
         }
+        pipe_tag(("L" + std::to_string(layer) + ".mlpout").c_str(), hidden_dev, (size_t)rows * hidden);
     }
     prefetch_experts();
     dev_->rms_norm_add(hidden_dev, residual_dev, final_norm_, norm_dev, rows, hidden, eps);

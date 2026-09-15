@@ -195,6 +195,15 @@ int main(int argc, char** argv) {
       ctx.max_blocks = max_blocks;
       auto lg = model.forward_logits(ctx);
       const float* row = &lg[0];
+      if (getenv("NANO_DEBUG")) {
+        std::vector<int> idx(config.hf.vocab_size);
+        for (int i = 0; i < config.hf.vocab_size; ++i) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                          [&](int a, int b) { return row[a] > row[b]; });
+        std::fprintf(stderr, "gpu top5:");
+        for (int k = 0; k < 5; ++k) std::fprintf(stderr, " %d(%.3f)", idx[k], row[idx[k]]);
+        std::fprintf(stderr, "\n");
+      }
       int nxt = sample_row(row, config.hf.vocab_size, temperature, top_p, rng, out.data(), out.size(),
                            rep_penalty, rep_window);
       std::fprintf(stderr, "prefill next=%d\n", nxt);

@@ -123,7 +123,11 @@ bool WeightLoader::load_float(const std::string& st_name, std::vector<float>& ou
 }
 
 bool WeightLoader::load_u16(const std::string& st_name, std::vector<uint16_t>& out, bool& bf16) const {
-  return st_ ? st_loader_.load_u16(st_name, out, bf16) : gg_loader_.load_u16(map(st_name), out, bf16);
+  if (st_) return st_loader_.load_u16(st_name, out, bf16);
+  if (gg_loader_.load_u16(map(st_name), out, bf16)) return true;
+  // Host upcast for quants with no GPU dequant kernel (Q2_K/Q3_K/Q5_0/Q4_0/Q4_1/IQ4_NL/IQ4_XS...).
+  if (gg_loader_.load_upcast_f16(map(st_name), out)) { bf16 = false; return true; }
+  return false;
 }
 
 bool WeightLoader::load_q8(const std::string& st_name, std::vector<uint8_t>& out) const {
@@ -463,8 +467,26 @@ void Qwen3Model::load_weights() {
         lw.qkv.qk_segs.clear();
         lw.qkv.is_q8 = true;
       } else if (q_kind || k_kind || v_kind) {
-        if (!(q_kind && k_kind && v_kind))
-          throw std::runtime_error("mixed K-quant/non-K-quant q/k/v weights are unsupported");
+        if (!(q_kind && k_kind && v_kind)) {
+          // Mixed K-quant/non-K-quant: upcast every tensor to F16 host-side
+          // (load_u16 covers Q2_K/Q4_K/Q6_K/etc via load_upcast_f16) and fuse.
+          std::vector<uint16_t> fused;
+          auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u) {
+            if (u.empty()) {
+              bool b = false;
+              if (!loader.load_u16(n, u, b) || u.empty())
+                throw std::runtime_error("mixed-precision q/k/v needs F16 for " + n);
+            }
+            fused.insert(fused.end(), u.begin(), u.end());
+          };
+          fuse_u16(p + ".self_attn.q_proj.weight", q_u);
+          fuse_u16(p + ".self_attn.k_proj.weight", k_u);
+          fuse_u16(p + ".self_attn.v_proj.weight", v_u);
+          upload_u16(lw.qkv.f16, fused);
+          lw.qkv.q8.free(); lw.qkv.qsc.free(); lw.qkv.qk.free(); lw.qkv.qk_segs.clear();
+          lw.qkv.is_q8 = false;
+          lw.qkv.bf16 = false;  // upcast output is F16, not BF16
+        } else {
         size_t qe = size_t(q_size_) * hidden, ke = size_t(kv_size_) * hidden;
         if (qe % 256 || ke % 256)
           throw std::runtime_error("K-quant q/k/v split is not on a super-block boundary");
@@ -481,6 +503,7 @@ void Qwen3Model::load_weights() {
         lw.qkv.q8.free();
         lw.qkv.qsc.free();
         lw.qkv.is_q8 = false;
+        }
       } else {
         std::vector<uint16_t> fused;
         concat_rows_u(fused, q_u, k_u, v_u);
@@ -530,8 +553,24 @@ void Qwen3Model::load_weights() {
         lw.gate_up.qk_segs.clear();
         lw.gate_up.is_q8 = true;
       } else if (g_kind || u_kind) {
-        if (!(g_kind && g_kind == u_kind))
-          throw std::runtime_error("mixed K-quant gate/up needs split dispatch (unsupported)");
+        if (!(g_kind && u_kind && g_kind == u_kind)) {
+          // Mixed K-quant gate/up: upcast to F16 host-side and fuse.
+          std::vector<uint16_t> fused;
+          auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u) {
+            if (u.empty()) {
+              bool b = false;
+              if (!loader.load_u16(n, u, b) || u.empty())
+                throw std::runtime_error("mixed-precision gate/up needs F16 for " + n);
+            }
+            fused.insert(fused.end(), u.begin(), u.end());
+          };
+          fuse_u16(p + ".mlp.gate_proj.weight", g_u);
+          fuse_u16(p + ".mlp.up_proj.weight", u_u);
+          upload_u16(lw.gate_up.f16, fused);
+          lw.gate_up.q8.free(); lw.gate_up.qsc.free(); lw.gate_up.qk.free(); lw.gate_up.qk_segs.clear();
+          lw.gate_up.is_q8 = false;
+          lw.gate_up.bf16 = false;  // upcast output is F16, not BF16
+        } else {
         if ((size_t(inter) * hidden) % 256)
           throw std::runtime_error("K-quant gate/up split is not on a super-block boundary");
         size_t gb = size_t(inter) * hidden / 256 * GGUFLoader::qk_block_bytes(g_kind);
@@ -545,6 +584,7 @@ void Qwen3Model::load_weights() {
         lw.gate_up.q8.free();
         lw.gate_up.qsc.free();
         lw.gate_up.is_q8 = false;
+        }
       } else {
         std::vector<uint16_t> fused;
         fused.reserve(g_u.size() + u_u.size());

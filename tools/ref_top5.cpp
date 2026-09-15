@@ -156,10 +156,10 @@ struct WL {
                 mn = (blk[4 + j + 4] >> 4) | ((blk[4 + j] >> 6) << 4);
               }
               float d1 = d * sc, m1 = dmin * mn;
+              int base = (j >> 1) * 32, sh = (j & 1) * 4;
               for (int l = 0; l < 16; ++l) {
-                uint8_t qb = blk[16 + j * 16 + l];
-                out[b * 256 + j * 32 + l] = d1 * (qb & 0xF) - m1;
-                out[b * 256 + j * 32 + l + 16] = d1 * (qb >> 4) - m1;
+                out[b * 256 + j * 32 + 2 * l] = d1 * ((blk[16 + base + l] >> sh) & 0xF) - m1;
+                out[b * 256 + j * 32 + 2 * l + 1] = d1 * ((blk[16 + base + 16 + l] >> sh) & 0xF) - m1;
               }
             }
           } else if (kind == 13) {  // Q5_K: [d][dmin][12B scales][32B qh][128B qs]
@@ -322,6 +322,13 @@ int main() {
   if (!wl.vec("model.norm.weight", fn)) {
     fn.assign(hidden, 1.0f);
   }
+  auto ref_tag = [&](const std::string& stage, const std::vector<float>& h) {
+    if (!std::getenv("NANO_PIPE")) return;
+    double sum = 0; for (float x : h) sum += x;
+    std::fprintf(stderr, "[PIPE ref %s] n=%zu sum=%.6f first=%.6f,%.6f,%.6f\n",
+                 stage.c_str(), h.size(), sum, h[0], h[1], h[2]);
+  };
+  ref_tag("embed", hidden_s);
   for (int L = 0; L < nl; ++L) {
     std::string p = "model.layers." + std::to_string(L);
     wl.vec(p + ".input_layernorm.weight", inln);
@@ -341,6 +348,14 @@ int main() {
     wl.vec(p + ".self_attn.q_proj.bias", bq);
     wl.vec(p + ".self_attn.k_proj.bias", bk);
     wl.vec(p + ".self_attn.v_proj.bias", bv);
+    if (L == 0 && std::getenv("NANO_PIPE")) {
+      double wq=0,wk=0,wv=0; for(float x:Wq)wq+=x; for(float x:Wk)wk+=x; for(float x:Wv)wv+=x;
+      double b0lo=0,b0hi=0,b1lo=0,b1hi=0;
+      for(int i=0;i<128;i++){b0lo+=Wv[i];b0hi+=Wv[128+i];}
+      for(int i=0;i<128;i++){b1lo+=Wv[256+i];b1hi+=Wv[384+i];}
+      std::fprintf(stderr,"[PIPE refweight vsum=%.4f b0lo=%.4f b0hi=%.4f b1lo=%.4f b1hi=%.4f n=%zu\n",
+        wv,b0lo,b0hi,b1lo,b1hi,Wv.size());
+    }
     q.resize((size_t)T * qs);
     k.resize((size_t)T * ks);
     v.resize((size_t)T * ks);
@@ -359,6 +374,7 @@ int main() {
       memcpy(&v[(size_t)t * ks], yv.data(), yv.size() * 4);
     }
     bool has_qn = wl.vec(p + ".self_attn.q_norm.weight", qn) && !qn.empty();
+    if (L == 0) { ref_tag("L0.q", q); ref_tag("L0.k", k); ref_tag("L0.v", v); }
     bool has_kn = wl.vec(p + ".self_attn.k_norm.weight", kn) && !kn.empty();
     if (has_qn) {
       std::vector<float> nq;
@@ -389,6 +405,7 @@ int main() {
           k[b + d + hd / 2] = x2 * c + x1 * s;
         }
     }
+    if (L == 0) { ref_tag("L0.qrope", q); ref_tag("L0.krope", k); }
     memcpy(&K[(size_t)L * T * ks], k.data(), k.size() * 4);
     memcpy(&V[(size_t)L * T * ks], v.data(), v.size() * 4);
     // causal attention
@@ -415,6 +432,7 @@ int main() {
           attn[(size_t)t * qs + h * hd + d] = (float)(a / se);
         }
       }
+     if (L == 0) ref_tag("L0.attn", attn);
      for (int t = 0; t < T; ++t) {
        std::vector<float> x(qs);
        memcpy(x.data(), &attn[(size_t)t * qs], qs * 4);
@@ -422,6 +440,7 @@ int main() {
        matvec(Wo, x, hidden, qs, y);
        memcpy(&hidden_s[(size_t)t * hidden], y.data(), y.size() * 4);
      }
+     ref_tag("L" + std::to_string(L) + ".attnout", hidden_s);
      // post norm + mlp
     for (int t = 0; t < T; ++t)
       for (int i = 0; i < hidden; ++i) resid[(size_t)t * hidden + i] += hidden_s[(size_t)t * hidden + i];
@@ -528,8 +547,9 @@ int main() {
       std::vector<float> y;
       matvec(Wd, m, hidden, inter, y);
       memcpy(&hidden_s[(size_t)t * hidden], y.data(), y.size() * 4);
-    }
-    }
+     }
+     }
+     ref_tag("L" + std::to_string(L) + ".mlpout", hidden_s);
   }
   for (int i = 0; i < hidden; ++i) resid[(size_t)(T - 1) * hidden + i] += hidden_s[(size_t)(T - 1) * hidden + i];
   std::vector<float> last(hidden), nl2(hidden);
