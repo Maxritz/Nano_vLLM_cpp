@@ -693,9 +693,22 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
         int d = kv_heads * head_dim;
         if (d_slot.buffer && !ctx.slot_mapping.empty())
             dev_->store_kv(k_dev, v_dev, k_cache_[layer], v_cache_[layer], d_slot, kv_heads, head_dim, rows * d, 0u, 0u);
-        if (d_qseq.buffer && !ctx.query_seq.empty())
-            dev_->paged_attention(q_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
-                                  rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale, 0u, 0u);
+        if (d_qseq.buffer && !ctx.query_seq.empty()) {
+            // ATTN-1: single sw_start per dispatch from the longest sequence
+            // (exact for the usual single-request case); per-layer pattern flag.
+            int sw_start = 0;
+            bool use_sw = hf.sliding_window > 0 &&
+                (hf.sliding_window_pattern.empty() ||
+                 (layer < (int)hf.sliding_window_pattern.size() && hf.sliding_window_pattern[layer]));
+            if (use_sw && !ctx.query_key_len.empty()) {
+                int maxlen = 0;
+                for (auto v : ctx.query_key_len) maxlen = std::max(maxlen, (int)v);
+                if (maxlen > hf.sliding_window) sw_start = maxlen - hf.sliding_window;
+            }
+            dev_->paged_attention_ex(q_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
+                                     rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale,
+                                     sw_start, (float)hf.attn_logit_softcapping, 0u, 0u);
+        }
         if (layer == 0) pipe_tag("L0.attn", attn_dev, (size_t)rows * q_size_);
         dev_->matmul(attn_dev, lw.o, rows, hidden, q_size_, hidden_dev);
         pipe_tag(("L" + std::to_string(layer) + ".attnout").c_str(), hidden_dev, (size_t)rows * hidden);
@@ -804,5 +817,10 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
     std::vector<float> out((size_t)out_rows * hf.vocab_size);
     dev_->submit_wait();
     logits_dev.download(out.data(), (VkDeviceSize)out.size() * sizeof(float));
+    // ATTN-2: Gemma final-logit softcap (host-side; exact, negligible cost).
+    if (hf.final_logit_softcapping > 0) {
+        float c = (float)hf.final_logit_softcapping;
+        for (float& x : out) x = std::tanh(x / c) * c;
+    }
     return out;
 }

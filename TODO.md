@@ -33,10 +33,10 @@ until the entire list below is green.
 - [ ] VKLAYOUT-2: A/B golden (_vk vs source GGUF, greedy token match)
 
 ## ATTN
-- [ ] ATTN-1: sliding-window bounds in paged_attention (Gemma SWA + bounded-KV
+- [x] ATTN-1: sliding-window bounds in paged_attention (Gemma SWA + bounded-KV
       decode). State: shader sw_start + backend PC wired; vulkan_model.cpp passes
       0,0 -- needs config fields + GGUF mapping.
-- [ ] ATTN-2: logit softcap (tanh) in attention + final logits (Gemma-2/3).
+- [x] ATTN-2: logit softcap (tanh) in attention + final logits (Gemma-2/3).
       State: attn softcap in shader; final-logits cap missing.
 - [ ] ATTN-3: K/V SLM tiling in paged_attention (prefill throughput, fewer V re-reads)
 

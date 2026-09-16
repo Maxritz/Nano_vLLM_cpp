@@ -28,6 +28,10 @@ struct HFConfig {
   int head_dim = 0;
   double rope_theta = 1000000.0;
   double rms_norm_eps = 1e-6;
+  int sliding_window = 0;               // 0 = full attention (Gemma SWA sets N)
+  std::vector<char> sliding_window_pattern;  // per-layer SWA flag (empty = uniform)
+  double attn_logit_softcapping = 0.0;  // in-attention tanh cap (Gemma-2/3)
+  double final_logit_softcapping = 0.0;  // final-logits tanh cap (Gemma final_logit_softcapping)
   bool attention_bias = false;
   bool tie_word_embeddings = true;
   std::string hidden_act = "silu";
@@ -69,6 +73,21 @@ struct HFConfig {
     if (c.head_dim == 0 && c.num_attention_heads) c.head_dim = c.hidden_size / c.num_attention_heads;
     if (cfg->contains("rope_theta")) c.rope_theta = cfg->at("rope_theta").as_number();
     if (cfg->contains("rms_norm_eps")) c.rms_norm_eps = cfg->at("rms_norm_eps").as_number();
+    if (cfg->contains("sliding_window") && !cfg->at("sliding_window").is_array())
+      c.sliding_window = cfg->at("sliding_window").as_int();  // array (alternating SWA) unsupported: stays 0
+    if (cfg->contains("attn_logit_softcapping"))
+      c.attn_logit_softcapping = cfg->at("attn_logit_softcapping").as_number();
+    if (cfg->contains("final_logit_softcapping"))
+      c.final_logit_softcapping = cfg->at("final_logit_softcapping").as_number();
+    if (cfg->contains("sliding_window_pattern") && cfg->at("sliding_window_pattern").is_array()) {
+      bool any_t = false, any_f = false;
+      for (const auto& e : cfg->at("sliding_window_pattern").as_array()) {
+        char v = e.as_bool() ? 1 : 0;
+        c.sliding_window_pattern.push_back(v);
+        any_t = any_t || v; any_f = any_f || !v;
+      }
+      if (!any_t) c.sliding_window = 0;
+    }
     if (cfg->contains("attention_bias")) c.attention_bias = cfg->at("attention_bias").as_bool();
     if (cfg->contains("tie_word_embeddings")) c.tie_word_embeddings = cfg->at("tie_word_embeddings").as_bool();
     if (cfg->contains("hidden_act")) c.hidden_act = cfg->at("hidden_act").as_string();
@@ -110,6 +129,25 @@ static void fill_from_gguf(HFConfig& c, const GGUFLoader& g) {
   if (g.meta_f64(arch + ".attention.layer_norm_epsilon", d)) c.rms_norm_eps = d;
   if (g.meta_f64(arch + ".rope.freq_base", d)) c.rope_theta = d;
   if (g.meta_u32(arch + ".context_length", u)) c.max_position_embeddings = static_cast<int>(u);
+  if (g.meta_u32(arch + ".attention.sliding_window", u)) c.sliding_window = static_cast<int>(u);
+  if (g.meta_f64(arch + ".attn_logit_softcapping", d)) c.attn_logit_softcapping = d;
+  if (g.meta_f64(arch + ".final_logit_softcapping", d)) c.final_logit_softcapping = d;
+  {
+    std::vector<int32_t> pat;
+    if (g.meta_i32_array(arch + ".attention.sliding_window_pattern", pat) && !pat.empty()) {
+      c.sliding_window_pattern.reserve(pat.size());
+      for (int32_t v : pat) c.sliding_window_pattern.push_back(v ? 1 : 0);
+      bool any_t = false, any_f = false;
+      for (char v : c.sliding_window_pattern) { any_t = any_t || v; any_f = any_f || !v; }
+      if (!any_t) c.sliding_window = 0;  // all-global: window unused
+      // Dim-heterogeneous hybrids (per-layer head dims, shared KV) exceed the
+      // uniform-layer engine: fail loud instead of silently generating garbage.
+      if (any_t && any_f &&
+          (g.meta(arch + ".attention.key_length_swa") || g.meta(arch + ".attention.value_length_swa") ||
+           g.meta(arch + ".rope.dimension_count_swa") || g.meta(arch + ".attention.shared_kv_layers")))
+        throw std::runtime_error("hybrid sliding-window architecture with per-layer head dims (e.g. gemma4-style) is unsupported");
+    }
+  }
   if (g.meta_u32(arch + ".vocab_size", u)) c.vocab_size = static_cast<int>(u);
   if (c.vocab_size <= 0) {
     std::vector<std::string> tokens;
