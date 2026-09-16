@@ -1,12 +1,20 @@
 #define NOMINMAX
 #include "nanovllm/http_server.hpp"
+#include "nanovllm/profiles.hpp"
+#include "nanovllm/bm25.hpp"
+#include "nanovllm/mcp_client.hpp"
+#include "nanovllm/reason.hpp"
+#include "nanovllm/gen.hpp"
+#include "nanovllm/drafter.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -92,7 +100,9 @@ static int sample_row(const float* logits, int vocab, double temp, double top_p,
 static std::string run_turn(VulkanModel& model, const Config& config, const Tokenizer& tok,
                             const std::vector<int>& prompt_ids, std::vector<int>& out, int& pos,
                             double temperature, double top_p, double rep_penalty, int rep_window,
-                            int max_tokens, std::mt19937& rng) {
+                            int max_tokens, std::mt19937& rng,
+                            const drafter::NgramIndex* draft = nullptr, int draft_k = 8,
+                            int draft_n = 2) {
   int bsize = config.kvcache_block_size;
   int max_blocks = 64;
   std::vector<int32_t> bt(max_blocks, -1);
@@ -124,6 +134,66 @@ static std::string run_turn(VulkanModel& model, const Config& config, const Toke
   std::string text = tok.decode_tokens({nxt});
   out.push_back(nxt);
   while ((int)out.size() < max_tokens && nxt != config.eos) {
+    // DEC-2: speculative decode. The drafter predicts K tokens from the last
+    // n-1 generated tokens; we feed {last, d[0..K-1]} in ONE forward and
+    // accept the matching prefix. Rejected draft slots sit beyond the next
+    // read position (query_key_len = pos+accept+1), so no rollback is needed.
+    // lg[i] predicts d[i] for i<K; lg[K] predicts after d[K-1].
+    int vocab = config.hf.vocab_size;
+    int accepted = 0;
+    if (draft && draft_k > 0 && temperature <= 0.0) {
+      std::vector<int> tail;
+      int tn = std::min(draft_n - 1, (int)out.size());
+      if (tn > 0) tail.assign(out.end() - tn, out.end());
+      auto m = draft->suggest(tail);
+      if (m.found && (int)m.draft.size() > 1) {
+        std::vector<int> d = m.draft;  // [gram..., successor]
+        int K = std::min(draft_k, (int)d.size());
+        VKContext s;
+        s.input_ids.reserve(1 + K);
+        s.input_ids.push_back(out.back());
+        for (int i = 0; i < K; ++i) s.input_ids.push_back(d[i]);
+        int total = 1 + K;
+        s.positions.resize(total);
+        for (int i = 0; i < total; ++i) s.positions[i] = pos - 1 + i;
+        s.slot_mapping.resize(total);
+        for (int i = 0; i < total; ++i) s.slot_mapping[i] = (int32_t)(pos - 1 + i);
+        std::vector<int32_t> bt3(max_blocks, -1);
+        for (int i = 0; i <= pos - 1 + K; ++i) bt3[i / bsize] = (int32_t)(i / bsize);
+        s.block_tables = bt3;
+        s.query_seq = std::vector<int32_t>(total, 0);
+        s.query_key_len.resize(total);
+        for (int i = 0; i < total; ++i) s.query_key_len[i] = (pos - 1 + i) + 1;
+        s.last_indices.resize(total);
+        for (int i = 0; i < total; ++i) s.last_indices[i] = i;
+        s.max_blocks = max_blocks;
+        auto lg = model.forward_logits(s);
+        const float* base = lg.data();
+        for (int i = 0; i < K; ++i) {
+          const float* r = base + (size_t)i * vocab;
+          int arg = (int)(std::max_element(r, r + vocab) - r);
+          if (arg != d[i]) { accepted = i; break; }
+          accepted = i + 1;
+        }
+        if (getenv("NANO_DEBUG"))
+          std::fprintf(stderr, "[T] draft K=%d accepted=%d\n", K, accepted);
+        // Emit the accepted prefix, then sample the tail from the row that
+        // disagreed (or lg[K] if all K matched).
+        int emit_n = accepted;
+        for (int i = 0; i < emit_n; ++i) {
+          text += tok.decode_tokens({d[i]});
+          out.push_back(d[i]); ++pos;
+        }
+        const float* prow = base + (size_t)accepted * vocab;
+        int t = sample_row(prow, vocab, temperature, top_p, rng,
+                           out.data(), out.size(), rep_penalty, rep_window);
+        if (t == config.eos) break;
+        text += tok.decode_tokens({t});
+        out.push_back(t); ++pos;
+        continue;
+      }
+    }
+    // Baseline: one token per forward.
     VKContext d;
     d.input_ids = {out.back()};
     d.positions = {pos};
@@ -137,7 +207,7 @@ static std::string run_turn(VulkanModel& model, const Config& config, const Toke
     d.max_blocks = max_blocks;
     auto lg2 = model.forward_logits(d);
     row = &lg2[0];
-    int t = sample_row(row, config.hf.vocab_size, temperature, top_p, rng,
+    int t = sample_row(row, vocab, temperature, top_p, rng,
                        out.data(), out.size(), rep_penalty, rep_window);
     if (t == config.eos) break;
     text += tok.decode_tokens({t});
@@ -147,14 +217,39 @@ static std::string run_turn(VulkanModel& model, const Config& config, const Toke
   return text;
 }
 
+// REAS-1 / GEN-1: post-process a raw reply. --strip-thinking removes reasoning
+// blocks; --json-shape enforces a JSON object shape, stopping the turn on the
+// first rejected character. Returns the final text to print.
+static std::string postprocess_reply(const std::string& raw, bool strip_think,
+                                     const std::string& json_shape) {
+  std::string out = raw;
+  if (strip_think) out = reason::strip_thinking(out);
+  if (json_shape.empty()) return out;
+  std::unique_ptr<gen::Constraint> c = gen::json_shape(json_shape);
+  if (!c) return out;
+  std::string ok;
+  for (char ch : out) {
+    if (!c->allow(ch)) break;
+    c->feed(ch);
+    ok += ch;
+  }
+  return ok;
+}
+
 // AGENT-1: tool executor. `name=cmd` registers a shell command; the agent loop
 // parses a tool call from the model's reply, runs the matching command with
 // the JSON args piped to its stdin, and feeds stdout back as the next user
 // turn. No tool found -> the reply is final text.
+// REAS-1: --strip-thinking drops [thinking]..[/thinking] blocks from the reply
+// before it is printed (model reasoning is discarded, only the answer shows).
+// GEN-1: --json-shape a,b,c constrains the reply to a JSON object with exactly
+// those keys; a rejected character stops the turn (the partial text is kept).
 struct ToolExec {
   std::string name, cmd;
 };
+struct McpExec { std::string name; mcp::Client* client; };  // MCP-1: tool served by an MCP server
 static std::string run_tool(const std::vector<ToolExec>& tools,
+                            const std::vector<McpExec>& mcp_tools,
                             const agent::Call& call) {
   for (const auto& t : tools) {
     if (t.name == call.name) {
@@ -170,6 +265,14 @@ static std::string run_tool(const std::vector<ToolExec>& tools,
       while (std::fgets(buf, sizeof(buf), p)) out += buf;
       std::fclose(p);
       return out;
+    }
+  }
+  for (const auto& m : mcp_tools) {
+    if (m.name == call.name) {
+      auto contents = m.client->call_tool(call.name, call.args);
+      std::string out;
+      for (const auto& c : contents) out += c.text;
+      return out.empty() ? std::string("[tool error] empty MCP result") : out;
     }
   }
   return std::string("[tool error] unknown tool: ") + call.name;
@@ -188,6 +291,8 @@ int main(int argc, char** argv) {
     double temperature = 0.0;
     double top_p = 1.0;
     bool temp_set = false, topp_set = false, maxtok_set = false;  // HF-1: CLI wins over generation_config.json
+    bool rep_set = false, repwin_set = false, mml_set = false;
+    std::string profile_name;  // PROF-1: --profile chat|long|bench|default
     double rep_penalty = 1.0;  // SAMP-1: 1.0 = off (current behavior exactly)
     int rep_window = 64;
     std::string server_host = "127.0.0.1";
@@ -197,22 +302,39 @@ int main(int argc, char** argv) {
     bool vram_flag = false;
     std::string tools_spec;          // AGENT-1: "name=cmd,name=cmd,..."
     int max_iters = 0;               // AGENT-1: 0 = no tool loop
+    std::string mcp_cmd;             // MCP-1: "name=cmd" served by an MCP server
+    std::string rag_path;            // RAG-1: newline-delimited "id<TAB>text" docs
+    int rag_top_k = 3;               // RAG-1: BM25 top-k docs per turn
+    size_t rag_max_chars = 2048;     // RAG-1: context budget before the user turn
+    bool strip_think = false;        // REAS-1: drop [thinking]..[/thinking] blocks
+    std::string json_shape;          // GEN-1: constrain output to a JSON shape
+    int draft_n = 0;                 // DEC-2: n-gram order (0 = off)
+    int draft_k = 8;                 // DEC-2: draft length per step
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--max-tokens" && i + 1 < argc) { max_tokens = std::atoi(argv[++i]); maxtok_set = true; }
-      else if (a == "--max-model-len" && i + 1 < argc) max_model_len = std::atoi(argv[++i]);
+      else if (a == "--max-model-len" && i + 1 < argc) { max_model_len = std::atoi(argv[++i]); mml_set = true; }
       else if (a == "--chat") use_chat = true;
       else if (a == "--repl") use_repl = true;
       else if (a == "--system" && i + 1 < argc) system_prompt = argv[++i];
       else if (a == "--temperature" && i + 1 < argc) { temperature = std::atof(argv[++i]); temp_set = true; }
       else if (a == "--top-p" && i + 1 < argc) { top_p = std::atof(argv[++i]); topp_set = true; }
-      else if (a == "--rep-penalty" && i + 1 < argc) rep_penalty = std::atof(argv[++i]);
-      else if (a == "--rep-window" && i + 1 < argc) rep_window = std::atoi(argv[++i]);
+else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++i]); rep_set = true; }
+      else if (a == "--rep-window" && i + 1 < argc) { rep_window = std::atoi(argv[++i]); repwin_set = true; }
+      else if (a == "--profile" && i + 1 < argc) profile_name = argv[++i];
       else if (a == "--bench" && i + 1 < argc) bench_runs = std::atoi(argv[++i]);
       else if (a == "--vram") vram_flag = true;
       else if (a == "--tools" && i + 1 < argc) tools_spec = argv[++i];
       else if (a == "--max-iters" && i + 1 < argc) max_iters = std::atoi(argv[++i]);
+      else if (a == "--mcp" && i + 1 < argc) mcp_cmd = argv[++i];
+      else if (a == "--strip-thinking") strip_think = true;
+      else if (a == "--json-shape" && i + 1 < argc) json_shape = argv[++i];
+      else if (a == "--rag-docs" && i + 1 < argc) rag_path = argv[++i];
+      else if (a == "--rag-top-k" && i + 1 < argc) rag_top_k = std::atoi(argv[++i]);
+      else if (a == "--rag-chars" && i + 1 < argc) rag_max_chars = (size_t)std::atoi(argv[++i]);
+      else if (a == "--draft-n" && i + 1 < argc) draft_n = std::atoi(argv[++i]);
+      else if (a == "--draft-k" && i + 1 < argc) draft_k = std::atoi(argv[++i]);
       else if (a == "--server") server_mode = true;
       else if (server_mode && server_host == "127.0.0.1" && argv[i][0] != '-') {
         if (strchr(argv[i], '.')) server_host = argv[i];
@@ -228,6 +350,23 @@ int main(int argc, char** argv) {
     config.model = model_dir;
     config.max_model_len = max_model_len;
     config.load_hf_config();
+    // PROF-1: --profile chat|long|bench|default sets generation + KV-cache
+    // defaults. CLI flags already set on those fields win over the profile.
+    if (!profile_name.empty()) {
+      profile::Profile pr = profile::get(profile_name);
+      if (!temp_set) temperature = pr.temperature;
+      if (!topp_set) top_p = pr.top_p;
+      if (!maxtok_set) max_tokens = pr.max_tokens;
+      if (!rep_set) rep_penalty = pr.rep_penalty;
+      if (!repwin_set) rep_window = pr.rep_window;
+      if (!mml_set) max_model_len = pr.max_model_len;
+      if (pr.use_chat) use_chat = true;
+      if (!system_prompt.empty()) system_prompt = pr.system_prompt;
+      if (getenv("NANO_DEBUG"))
+        std::fprintf(stderr, "[T] profile=%s temp=%.2f top_p=%.2f max_tokens=%d rep=%.2f repwin=%d mml=%d chat=%d\n",
+                     profile_name.c_str(), temperature, top_p, max_tokens, rep_penalty,
+                     rep_window, max_model_len, (int)use_chat);
+    }
     // HF-1: generation_config.json values are defaults only; explicit CLI wins.
     if (!temp_set && config.has_gen_temperature) temperature = config.gen_temperature;
     if (!topp_set && config.has_gen_top_p) top_p = config.gen_top_p;
@@ -240,6 +379,28 @@ int main(int argc, char** argv) {
     if (tok.eos_token_id() >= 0) config.eos = tok.eos_token_id();
     else if (config.has_gen_eos) config.eos = config.gen_eos;
 
+    // RAG-1: BM25 retrieval index. --rag-docs path loads newline-delimited
+    // "id<TAB>text" rows; each user turn is stuffed with the top-k hits
+    // before tokenization (context budget = --rag-chars).
+    rag::Index rag_idx;
+    if (!rag_path.empty()) {
+      std::ifstream rf(rag_path);
+      std::string line;
+      while (std::getline(rf, line)) {
+        if (line.empty()) continue;
+        std::string id, text;
+        auto tab = line.find('\t');
+        if (tab != std::string::npos) { id = line.substr(0, tab); text = line.substr(tab + 1); }
+        else { id = line; text = line; }
+        if (!id.empty()) rag_idx.add({id, text});
+      }
+      if (!rag_idx.empty()) {
+        rag_idx.build();
+        if (getenv("NANO_DEBUG"))
+          std::fprintf(stderr, "[T] rag index built docs=%zu\n", rag_idx.size());
+      }
+    }
+
     VulkanModel model(config);
     model.load_weights();
     model.alloc_expert_slots();
@@ -250,6 +411,14 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int> ids = tok.encode_text(prompt);
+    // DEC-2: model-free n-gram drafter (TokenSwift-style). Built once from the
+    // prompt; suggest() uses only the index, so it stays valid across turns.
+    drafter::NgramIndex drafter;
+    if (draft_n >= 2 && !ids.empty()) {
+      drafter.build(ids, draft_n);
+      if (getenv("NANO_DEBUG"))
+        std::fprintf(stderr, "[T] drafter n=%d built on %d prompt tokens\n", draft_n, (int)ids.size());
+    }
     if (server_mode) {
       // SERV-1: OpenAI-compatible loop. One request at a time (mutex guards
       // the shared KV cache; concurrent batching is SERV-2).
@@ -257,6 +426,7 @@ int main(int argc, char** argv) {
       minihttp::Handler handler = [&](const minihttp::ChatRequest& req) -> std::string {
         std::lock_guard<std::mutex> lk(srv_mu);
         std::string text = req.last_user;
+        if (!rag_idx.empty()) text = rag_idx.stuff(text, text, rag_top_k, rag_max_chars);
         if (tok.has_chat_template()) text = tok.apply_chat_template(text);
         std::vector<int> rids = tok.encode_text(text);
         if (rids.empty()) return "";
@@ -367,6 +537,32 @@ int main(int argc, char** argv) {
         at.schema = "{}";
         agloop.add_tool(at);
       }
+      // MCP-1: an MCP server process exposes tools over JSON-RPC on stdio.
+      // --mcp "name=cmd" spawns it, lists its tools, and dispatches calls to it.
+      std::unique_ptr<mcp::Client> mcp_client;
+      std::vector<McpExec> mcp_tools;
+      if (!mcp_cmd.empty()) {
+        auto eq = mcp_cmd.find('=');
+        std::string mname = eq != std::string::npos ? mcp_cmd.substr(0, eq) : mcp_cmd;
+        std::string mcmd = eq != std::string::npos ? mcp_cmd.substr(eq + 1) : mcp_cmd;
+        try {
+          mcp_client = std::make_unique<mcp::Client>(mcmd);
+          if (mcp_client->initialize()) {
+            for (const auto& mt : mcp_client->list_tools()) {
+              agent::Tool at;
+              at.name = mt.name;
+              at.schema = mt.schema.empty() ? "{}" : mt.schema;
+              agloop.add_tool(at);
+              mcp_tools.push_back({mt.name, mcp_client.get()});
+              if (getenv("NANO_DEBUG"))
+                std::fprintf(stderr, "[T] mcp tool=%s\n", mt.name.c_str());
+            }
+          }
+        } catch (const std::exception& e) {
+          std::fprintf(stderr, "[mcp] spawn failed: %s\n", e.what());
+          mcp_client.reset();
+        }
+      }
       std::string sys_block = agloop.tools_system_block();
 
       std::vector<int> out;
@@ -377,13 +573,14 @@ int main(int argc, char** argv) {
         if (line.empty()) continue;
         std::vector<int> turn_ids;
         std::string prompt_text = line;
-        if (!sys_block.empty()) prompt_text = sys_block + "\n" + line;
+        if (!rag_idx.empty()) prompt_text = rag_idx.stuff(prompt_text, line, rag_top_k, rag_max_chars);
+        if (!sys_block.empty()) prompt_text = sys_block + "\n" + prompt_text;
         if (tok.has_chat_template()) turn_ids = tok.encode_text(tok.apply_chat_template(prompt_text, system_prompt));
         else turn_ids = tok.encode_text(prompt_text);
         if (turn_ids.empty()) continue;
         std::string reply = run_turn(model, config, tok, turn_ids, out, pos,
                                      temperature, top_p, rep_penalty, rep_window,
-                                     max_tokens, rng);
+                                     max_tokens, rng, &drafter, draft_k, draft_n);
         // AGENT-1: tool-call loop.
         int iters = 0;
         while (max_iters > 0 && iters < max_iters) {
@@ -391,7 +588,7 @@ int main(int argc, char** argv) {
           agent::Call c = agloop.find_call(reply, next_off);
           if (c.name.empty()) break;
           std::fprintf(stderr, "[tool] %s %s\n", c.name.c_str(), c.args.c_str());
-          std::string result = run_tool(tools, c);
+          std::string result = run_tool(tools, mcp_tools, c);
           std::string feed = std::string("Tool ") + c.name + " returned:\n" + result;
           std::vector<int> fids;
           if (tok.has_chat_template()) fids = tok.encode_text(tok.apply_chat_template(feed, system_prompt));
@@ -402,7 +599,7 @@ int main(int argc, char** argv) {
                            max_tokens, rng);
           ++iters;
         }
-        std::printf("%s\n", reply.c_str());
+        std::printf("%s\n", postprocess_reply(reply, strip_think, json_shape).c_str());
         std::fflush(stdout);
       }
       return 0;

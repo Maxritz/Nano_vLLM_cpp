@@ -1,10 +1,13 @@
 # TODO - Nano_vLLM_cpp (Vulkan-first)
 
 ## ISSUES (open, blocking or high-value)
-- [ ] WEBUI-1: the / route serving the chat page is unverified. /v1/models and
+- [x] WEBUI-1: the / route serving the chat page is unverified. /v1/models and
       /v1/chat/completions work; the HTML page built by http_server.hpp::build_webui()
       has not been loaded in a browser yet. This blocks the original ask
       (web UI at http://127.0.0.1:8099).
+      (VERIFIED: GET / -> 200 text/html, the nanovllm chat page; GET /v1/models -> 200
+      model list; POST /v1/chat/completions -> 200 with generated text
+      ("once upon a time" -> ", there was a little one of a den, old grand").)
 - [x] PERF-2: VulkanModel::memory_report() declared in vulkan_model.hpp but never
       implemented. --vram currently prints working_set_mb / kv counts, not the
       Vulkan heap report (memProps per heap: size + flags).
@@ -12,7 +15,41 @@
       per-heap size + flags + memType count + KV cache bytes/blocks/layers.
       Verified: "vram: device=Intel(R) Graphics heaps=1 heap0=9024MB
       device-local memTypes=3 kv_cache=216MB blocks=64 block_size=256 layers=6")
-- [ ] AGENT-LOOP: tool execution loop unwired (see AGENT-1).
+
+
+## DONE — engine work (wired into the binary)
+- [x] DEC-2: speculative decode via drafter.hpp (n-gram prompt-lookup, TokenSwift-style)
+- [x] RAG-1: bm25.hpp retrieval wired into --repl and --server (stuff() before each turn)
+- [x] MCP-1: mcp_client.hpp as a --repl tool source (run_tool() dispatches mcp_* tools)
+- [x] REAS-1: reason.hpp into --repl post-processing (postprocess_reply strips [thinking])
+- [x] GEN-1: gen.hpp into --repl constrained sampling (--json-shape)
+- [x] PROF-1 wiring: get()/names() into main_vulkan --profile
+
+## PENDING — engine work (13 items, not started)
+- [ ] SERV-2: embeddings endpoint + concurrent request batching (http_server.hpp + main_vulkan)
+- [ ] PF-1: chunked prefill (vulkan_model.cpp prefill path)
+- [ ] DEC-1: speculative decoding via MTP heads (vulkan_model.cpp)
+- [ ] KV-1: FP8 KV cache (shaders + vulkan_backend.cpp)
+- [ ] ATTN-3: K/V SLM tiling in paged_attention (shaders)
+- [ ] ATTN-4: mRoPE (qwen3-family; blocked on SSM+mRoPE)
+- [ ] QUANT-6: Q2_K native GPU kernel (shaders)
+- [ ] VERIFY workers: full golden matrix re-run after BOS fix (GPU==CPU all tags)
+- [ ] HIP re-mirror: src/model.cpp agent edits unverified, no ROCm toolchain here
+- [ ] 8GB-MoE (2/3): GGUF MoE naming (blk.N.ffn_*_exps) + lift gguf-only throw
+- [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place, bit-golden vs gguf-py
+- [ ] SAMP-1: verify sample_row's windowed rep_penalty vs spec
+- [ ] PROF-1 wiring: get()/names() into main_vulkan --profile
+
+## PENDING — headers built, wiring into the binary needed (9 items)
+- [ ] QUANT-4/5 wiring: dequant_mxfp4/awq/gptq into vulkan_model.cpp loader path
+- [ ] RAG-1 wiring: bm25.hpp into --repl/--server retrieval
+- [ ] MCP-1 wiring: mcp_client.hpp as a --repl tool source
+- [ ] ADAPT-1 wiring: lora.hpp into the weight loading path
+- [ ] DEC-2 wiring: drafter.hpp into the decode loop
+- [ ] CACHE-1 wiring: cache.hpp into the KV block manager
+- [ ] REAS-1 wiring: reason.hpp into --repl post-processing
+- [ ] GEN-1 wiring: gen.hpp into --repl constrained sampling
+- [ ] PLUG-2 wiring: build the streaming DLL (kv_policy.hpp source, edge_plugin_desc) + --kv-policy/--ctx-window/--rope-scale
 
 
 Every backlog item keeps its own line with its own status. Debug probes

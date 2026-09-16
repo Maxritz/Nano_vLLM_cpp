@@ -21,6 +21,8 @@ public:
         docs_.push_back(std::move(d));
     }
 
+    bool empty() const { return docs_.empty(); }
+    size_t size() const { return docs_.size(); }
     void build() {
         // Count document frequencies for each term.
         std::map<std::string, int> df;
@@ -255,6 +257,18 @@ int main() {
         std::string result = idx.stuff(prompt, "cafÃ©", 1, 1000);
         // Check that the UTF-8 text appears byte-identical in the result.
         assert(result.find(utf8_text) != std::string::npos);
+    }
+
+    // Test 4: empty()/size() accessors.
+    {
+        rag::Index idx;
+        assert(idx.empty());
+        assert(idx.size() == 0);
+        idx.add({"doc1", "hello"});
+        idx.add({"doc2", "world"});
+        idx.build();
+        assert(!idx.empty());
+        assert(idx.size() == 2);
     }
 
     std::cout << "All tests passed!" << std::endl;

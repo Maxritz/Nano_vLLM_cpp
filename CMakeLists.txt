@@ -127,6 +127,8 @@ target_compile_options(lora_test PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/O2 /wd4100 /wd4101>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations>)
 add_executable(drafter_test test/drafter_test.cpp)
+add_executable(rag_test test/rag_test.cpp)
+target_include_directories(rag_test PRIVATE include)
 target_include_directories(drafter_test PRIVATE include)
 add_executable(cache_test test/cache_test.cpp)
 target_include_directories(cache_test PRIVATE include)
