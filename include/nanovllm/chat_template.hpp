@@ -295,19 +295,47 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
             return tag;
         }
 
+        // Strip Jinja whitespace-control dashes + surrounding space for tag identity.
+        static std::string normTag(std::string t) {
+            size_t a = t.find_first_not_of(" \t\r\n-");
+            if (a == std::string::npos) return "";
+            size_t b = t.find_last_not_of(" \t\r\n-");
+            return t.substr(a, b - a + 1);
+        }
+        static bool isWs(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+        void stripOutBack() { while (!out.empty() && isWs(out.back())) out.pop_back(); }
+
         void parseBlock(Ctx& ctx) {
             while (i < n) {
                 if (tmpl[i] == '{') {
                     if (i + 1 < n && tmpl[i+1] == '{') {
                         i += 2;
+                        if (i < n && tmpl[i] == '-') { stripOutBack(); i++; }
                         std::string expr = readUntil('}');
+                        bool stripR = false;
+                        { size_t e = expr.find_last_not_of(" \t\r\n");
+                          if (e != std::string::npos && expr[e] == '-') {
+                            expr.erase(e); stripR = true;
+                            size_t e2 = expr.find_last_not_of(" \t\r\n");
+                            expr = (e2 == std::string::npos) ? "" : expr.substr(0, e2 + 1);
+                          } }
                         if (i < n && tmpl[i] == '}') i++;
                         if (i < n && tmpl[i] == '}') i++;
                         std::string val = evalExpr(expr, ctx);
                         out += val;
+                        if (stripR) skipWs();
                     } else if (i + 1 < n && tmpl[i+1] == '%') {
                         i += 2;
+                        if (i < n && tmpl[i] == '-') { stripOutBack(); i++; }
                         std::string tag = readTag();
+                        bool stripR = false;
+                        if (!tag.empty() && tag.back() == '-') {
+                            tag.pop_back();
+                            size_t e = tag.find_last_not_of(" \t\r\n");
+                            tag = (e == std::string::npos) ? "" : tag.substr(0, e + 1);
+                            stripR = true;
+                        }
+                        if (stripR) skipWs();
 
                         if (tag.rfind("for ", 0) == 0) {
                             size_t inPos = tag.find(" in ");
@@ -331,7 +359,7 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
                                 while (i < n) {
                                     if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
                                         i += 2;
-                                        std::string innerTag = readTag();
+                                        std::string innerTag = normTag(readTag());
                                         if (innerTag.rfind("for ", 0) == 0) depth++;
                                         else if (innerTag == "endfor") {
                                             depth--;
@@ -362,7 +390,21 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
                                 // Skip past endfor tag (already consumed by readTag in the scan)
                                 // Actually, readTag already advanced i past the endfor tag
                             } else {
-                                throw std::runtime_error("Unsupported for iterator: " + iterName);
+                                // Non-messages iterator (e.g. message.tool_calls): our Msg
+                                // carries no lists, so the iterable is empty -> zero
+                                // iterations (Jinja-correct). Skip to matching endfor.
+                                { std::string iv = evalExpr(iterName, ctx);
+                                  if (!(iv.empty() || iv == "false"))
+                                    throw std::runtime_error("Unsupported non-empty for iterator: " + iterName); }
+                                int depth = 1;
+                                while (i < n && depth > 0) {
+                                    if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
+                                        i += 2;
+                                        std::string t2 = normTag(readTag());
+                                        if (t2.rfind("for ", 0) == 0) depth++;
+                                        else if (t2 == "endfor") depth--;
+                                    } else i++;
+                                }
                             }
                         } else if (tag.rfind("if ", 0) == 0) {
                             parseIf(ctx, tag.substr(3));
@@ -396,27 +438,31 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
         }
 
         // Scan from i to the next elif/else/endif at depth 0 (nested if/for are
-        // skipped). Leaves i at the tag START, term = tag text. False at EOF.
-        bool scanArm(std::string& term) {
+        // skipped). Leaves i at the tag START; term = normalized tag text,
+        // termStripR = whether it closed with -%}. False at EOF.
+        bool scanArm(std::string& term, bool& termStripR) {
             while (i < n) {
                 if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
                     size_t save = i;
                     i += 2;
                     std::string tag = readTag();
-                    if (tag.rfind("if ", 0) == 0 || tag.rfind("for ", 0) == 0) {
+                    std::string nt = normTag(tag);
+                    if (nt.rfind("if ", 0) == 0 || nt.rfind("for ", 0) == 0) {
                         int depth = 1;
                         while (i < n && depth > 0) {
                             if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
                                 i += 2;
-                                std::string t2 = readTag();
+                                std::string t2 = normTag(readTag());
                                 if (t2.rfind("if ", 0) == 0 || t2.rfind("for ", 0) == 0) depth++;
                                 else if (t2 == "endif" || t2 == "endfor") depth--;
                             } else i++;
                         }
                         continue;
                     }
-                    if (tag.rfind("elif ", 0) == 0 || tag == "else" || tag == "endif") {
-                        i = save; term = tag; return true;
+                    if (nt.rfind("elif ", 0) == 0 || nt == "else" || nt == "endif") {
+                        i = save; term = nt;
+                        termStripR = (!tag.empty() && tag.back() == '-');
+                        return true;
                     }
                 } else i++;
             }
@@ -428,9 +474,10 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
             std::string cond = firstCond;
             for (;;) {
                 size_t armStart = i;
-                std::string term;
-                if (!scanArm(term)) throw std::runtime_error("Unterminated if");
+                std::string term; bool termStripR = false;
+                if (!scanArm(term, termStripR)) throw std::runtime_error("Unterminated if");
                 i += 2; readTag();  // consume terminator
+                if (termStripR) skipWs();
                 if (term.rfind("elif ", 0) == 0) {
                     if (evalCond(cond, ctx)) {
                         i = armStart;
@@ -451,13 +498,20 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
                 return;
             }
         }
-
-        void skipToTag(const std::string& tagName) {            while (i < n) {
+        void skipToTag(const std::string& tagName) {
+            int depth = 0;
+            while (i < n) {
                 if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
                     i += 2;
-                    std::string tag = readTag();
-                    if (tag == tagName) {
-                        return;
+                    std::string tag = normTag(readTag());
+                    if (tag.rfind("if ", 0) == 0 || tag.rfind("for ", 0) == 0) { depth++; continue; }
+                    if (tag == "endif" || tag == "endfor") {
+                        if (depth == 0) {
+                            if (tag == tagName) return;
+                            continue;  // stray close at depth 0: keep scanning
+                        }
+                        depth--;
+                        continue;
                     }
                 } else {
                     i++;

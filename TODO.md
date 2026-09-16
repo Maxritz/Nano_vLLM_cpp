@@ -9,7 +9,7 @@ until the entire list below is green.
       (VERIFIED: 'VK: dedicated transfer queue family 2' at runtime)
 - [x] P2-4: fused route+FFN single dispatch (optimistic + miss fixup, env-gated
       MOE_NO_FUSED, A/B verified prior session; re-check in VERIFY)
-- [ ] VERIFY workers: full build + MoE/dense/ATTN/TOK/QUANT golden matrix
+- [ ] VERIFY workers: full build (golden PASS 2x plain+chat; GPU==CPU all tags; tinyllama-1.1b degenerate = model property, SP-faithful proven) + MoE/dense/ATTN/TOK/QUANT golden matrix
       (IN PROGRESS: mixed-fuse fix + Q4_K canonical fix landed; GPU top5 == CPU
       ref top5 on tinyllama-q2k; matrix re-run pending after BOS fix)
 - [x] BOS prepend (NEW P0, root cause CONFIRMED): tokenizer.cpp load_gguf reads

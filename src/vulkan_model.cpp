@@ -276,6 +276,7 @@ void VulkanModel::load_matrix(const std::string& name, VMatrix& m, bool required
     std::vector<uint8_t> q8;
     if (load_q8(name, q8)) { upload_q8_block(q8, m); m.f16.free(); m.qk.free(); m.qk_segs.clear(); return; }
     for (int kind : {12, 13, 14}) {
+        if (kind == 14 && std::getenv("NANO_F16Q6")) continue;  // DBG tag: force Q6_K via F16 upcast
         std::vector<uint8_t> qk;
          if (load_qk(name, kind, n_elements, qk)) { upload_qk_block(qk, kind, m); return; }
     }

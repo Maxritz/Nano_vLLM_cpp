@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
   parse_ties(std::getenv("GOLDEN_TOKENS"), want, alt);
   if (want.empty()) { want = {12095, 13}; alt = {-1, -1}; }
   parse_ties(std::getenv("GOLDEN_TOKENS_CHAT"), want_chat, alt_chat);
-  if (want_chat.empty()) { want_chat = {95456, 0, 21193, 374, 264}; alt_chat = {-1, -1, -1, -1, -1}; }
+  if (want_chat.empty()) { want_chat = {95456, 0, 5692, 594, 264}; alt_chat = {-1, -1, -1, -1, -1}; }
   const char* chat_prompt = std::getenv("GOLDEN_CHAT_PROMPT");
   if (!chat_prompt) chat_prompt = "Write a Python function to reverse a string";
   int failures = 0;
