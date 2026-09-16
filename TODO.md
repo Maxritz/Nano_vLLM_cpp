@@ -70,10 +70,10 @@ until the entire list below is green.
 - [ ] HF-2: architectures-registry for loader dispatch (replace scattered probes)
 
 ## QUANT
-- [ ] QUANT-1: Q4_0/Q4_1 host upcast (Phi-3-mini-q4 + all Q4_0 files fail today).
+- [x] QUANT-1: Q4_0/Q4_1 host upcast (Phi-3-mini-q4 + all Q4_0 files fail today).
       State: kUpcastKinds HAS both entries -- probe-verify vs gguf-py dequantize,
       close or fix.
-- [ ] QUANT-2: IQ4_XS host upcast (gemma-4-12B file needs it). Same: entry exists,
+- [x] QUANT-2: IQ4_XS host upcast (gemma-4-12B file needs it). Same: entry exists,
       verify.
 - [x] QUANT-3: Q2_K host upcast (completes Q2_K-family coverage)
       (DONE: gguf-py canonical proof, head 6/6 + block-0 sum exact)
