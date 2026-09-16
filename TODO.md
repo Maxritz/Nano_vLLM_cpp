@@ -28,9 +28,9 @@ until the entire list below is green.
       (ran; bit-golden vs gguf-py method still open -> fold into VERIFY)
 
 ## VKLAYOUT
-- [ ] VKLAYOUT-1: tiled-layout reader (vulkan_native meta + tile index math in
+- [x] VKLAYOUT-1: tiled-layout reader (vulkan_native meta + tile index math in
       matmul_qk/embedding)
-- [ ] VKLAYOUT-2: A/B golden (_vk vs source GGUF, greedy token match)
+- [x] VKLAYOUT-2: A/B golden (_vk vs source GGUF, greedy token match)
 
 ## ATTN
 - [x] ATTN-1: sliding-window bounds in paged_attention (Gemma SWA + bounded-KV

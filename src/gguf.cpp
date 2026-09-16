@@ -245,7 +245,72 @@ bool GGUFLoader::meta_f32_array(const std::string& key, std::vector<float>& out)
   return true;
 }
 
+// Unified block geometry by dtype NAME (for the tiled-reader path).
+// vals = elements per block, bytes = storage bytes per block.
+namespace {
+static bool gguf_block_info(const std::string& dtype, size_t& vals, size_t& bytes) {
+  if (dtype == "F32") { vals = 1; bytes = 4; return true; }
+  if (dtype == "F16" || dtype == "BF16") { vals = 1; bytes = 2; return true; }
+  if (dtype == "Q4_0") { vals = 32; bytes = 18; return true; }
+  if (dtype == "Q4_1") { vals = 32; bytes = 20; return true; }
+  if (dtype == "Q5_0") { vals = 32; bytes = 22; return true; }
+  if (dtype == "Q5_1") { vals = 32; bytes = 24; return true; }
+  if (dtype == "Q8_0") { vals = 32; bytes = 34; return true; }
+  if (dtype == "Q2_K") { vals = 256; bytes = 84; return true; }
+  if (dtype == "Q3_K") { vals = 256; bytes = 110; return true; }
+  if (dtype == "Q4_K") { vals = 256; bytes = 144; return true; }
+  if (dtype == "Q5_K") { vals = 256; bytes = 176; return true; }
+  if (dtype == "Q6_K") { vals = 256; bytes = 210; return true; }
+  if (dtype == "Q8_K") { vals = 256; bytes = 292; return true; }
+  if (dtype == "IQ4_NL") { vals = 32; bytes = 18; return true; }
+  if (dtype == "IQ4_XS") { vals = 256; bytes = 136; return true; }
+  return false;
+}
+}  // namespace (gguf_block_info)
+
 void GGUFLoader::read_tensor_data(const GGUFTensorMeta& meta, void* out, size_t bytes) const {
+  auto read_raw = [&](void* dst, size_t n) {
+    std::ifstream f(path_, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot reopen gguf file: " + path_);
+    f.seekg(static_cast<std::streamoff>(data_offset_ + meta.offset));
+    f.read(reinterpret_cast<char*>(dst), n);
+    if (!f) throw std::runtime_error("truncated tensor data for " + meta.name);
+  };
+  std::string layout;
+  uint32_t tr = 0, tbc = 0;
+  if (meta_str("vulkan_native.layout", layout) && layout == "tiled" &&
+      meta_u32("vulkan_native.tile_rows", tr) && tr > 0 &&
+      meta_u32("vulkan_native.tile_block_cols", tbc) && tbc > 0 &&
+      meta.shape.size() == 2) {
+    // VKLAYOUT-1: block-tiled native mode. De-tile into standard ggml order
+    // (inverse of vulkanised/native_relayout.to_tiled_native). 1-D tensors
+    // pass through untiling per the converter.
+    size_t bv = 0, bb = 0;
+    if (!gguf_block_info(meta.dtype, bv, bb))
+      throw std::runtime_error("tiled tensor with unknown dtype " + meta.dtype + ": " + meta.name);
+    size_t ncols = static_cast<size_t>(meta.shape[0]);
+    size_t nrows = static_cast<size_t>(meta.shape[1]);
+    if (ncols % bv != 0)
+      throw std::runtime_error("tiled tensor cols not a multiple of block size: " + meta.name);
+    size_t bpr = ncols / bv;
+    size_t pr = (nrows + tr - 1) / tr * tr, pbc = (bpr + tbc - 1) / tbc * tbc;
+    if (bytes != nrows * bpr * bb)
+      throw std::runtime_error("tiled tensor logical size mismatch: " + meta.name);
+    std::vector<uint8_t> raw(pr * pbc * bb);
+    read_raw(raw.data(), raw.size());
+    size_t ntr = pr / tr, ntc = pbc / tbc;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(out);
+    for (size_t tyr = 0; tyr < ntr; ++tyr)
+      for (size_t tyc = 0; tyc < ntc; ++tyc)
+        for (size_t r = 0; r < tr; ++r)
+          for (size_t c = 0; c < tbc; ++c) {
+            size_t lr = tyr * tr + r, lbc = tyc * tbc + c;
+            if (lr >= nrows || lbc >= bpr) continue;  // zero padding: skip
+            std::memcpy(dst + (lr * bpr + lbc) * bb,
+                        raw.data() + (((tyr * ntc + tyc) * tr + r) * tbc + c) * bb, bb);
+          }
+    return;
+  }
   std::ifstream f(path_, std::ios::binary);
   if (!f) throw std::runtime_error("cannot reopen gguf file: " + path_);
   f.seekg(static_cast<std::streamoff>(data_offset_ + meta.offset));
@@ -304,6 +369,8 @@ size_t GGUFLoader::qk_block_bytes(int ggml_type) {
     default: return 0;
   }
 }
+
+
 
 namespace {
 
