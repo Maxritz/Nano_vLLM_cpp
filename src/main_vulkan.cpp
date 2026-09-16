@@ -22,14 +22,15 @@
 
 static void usage(const char* prog) {
   std::fprintf(stderr, "Usage: %s <model_dir> [prompt] [--max-tokens N] [--max-model-len N]\n", prog);
-  std::fprintf(stderr, "       [--chat] [--temperature T] [--top-p P]\n");
-  std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W]\n");
+  std::fprintf(stderr, "       [--chat] [--repl] [--temperature T] [--top-p P]\n");
+  std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W] [--system S]\n");
   std::fprintf(stderr, "       [--bench N] [--vram]\n");
-  std::fprintf(stderr, "        <model_dir> --server [host] [port]\n");
+  std::fprintf(stderr, "       <model_dir> --server [host] [port]\n");
   std::fprintf(stderr, "  Sampling defaults come from generation_config.json when present;\n");
   std::fprintf(stderr, "  explicit flags always win. --rep-penalty divides the logits of ids\n");
   std::fprintf(stderr, "  seen in the last W generated tokens (default 1.0 = off, --rep-window 64;\n");
   std::fprintf(stderr, "  --rep-window 0 = whole history). Greedy (temp<=0) is never penalized.\n");
+  std::fprintf(stderr, "  --repl: interactive chat loop reading stdin line by line (EOF to exit).\n");
 }
 
 // CPU sampler: greedy at temp<=0, else temperature + nucleus sampling.
@@ -81,6 +82,69 @@ static int sample_row(const float* logits, int vocab, double temp, double top_p,
   return idx[keep - 1];
 }
 
+// REPL-1: one generation turn over the shared KV cache. `out` is the running
+// generated-token history (across turns) so the model keeps conversational
+// context; `pos` is the current sequence length. Returns the decoded text and
+// appends generated ids to `out`. Mirrors the inline prefill/decode loops above
+// so behavior is identical (greedy at temp<=0, nucleus + windowed rep-penalty).
+static std::string run_turn(VulkanModel& model, const Config& config, const Tokenizer& tok,
+                            const std::vector<int>& prompt_ids, std::vector<int>& out, int& pos,
+                            double temperature, double top_p, double rep_penalty, int rep_window,
+                            int max_tokens, std::mt19937& rng) {
+  int bsize = config.kvcache_block_size;
+  int max_blocks = 64;
+  std::vector<int32_t> bt(max_blocks, -1);
+  // Absolute slots: append this turn's prompt after the retained history.
+  for (size_t i = 0; i < prompt_ids.size(); ++i) {
+    int slot = pos + (int)i;
+    bt[slot / bsize] = (int32_t)(slot / bsize);
+  }
+
+  VKContext ctx;
+  int n = (int)prompt_ids.size();
+  ctx.input_ids.assign(prompt_ids.begin(), prompt_ids.end());
+  ctx.positions.resize(n);
+  for (int i = 0; i < n; ++i) ctx.positions[i] = pos + i;
+  ctx.slot_mapping.resize(n);
+  for (int i = 0; i < n; ++i) ctx.slot_mapping[i] = (int32_t)(pos + i);
+  ctx.block_tables = bt;
+  ctx.query_seq = std::vector<int32_t>(n, 0);
+  ctx.query_key_len.resize(n);
+  for (int i = 0; i < n; ++i) ctx.query_key_len[i] = pos + i + 1;
+  ctx.last_indices = {n - 1};
+  ctx.max_blocks = max_blocks;
+
+  auto lg = model.forward_logits(ctx);
+  const float* row = &lg[0];
+  int nxt = sample_row(row, config.hf.vocab_size, temperature, top_p, rng,
+                       out.data(), out.size(), rep_penalty, rep_window);
+  pos += n;
+  std::string text = tok.decode_tokens({nxt});
+  out.push_back(nxt);
+  while ((int)out.size() < max_tokens && nxt != config.eos) {
+    VKContext d;
+    d.input_ids = {out.back()};
+    d.positions = {pos};
+    std::vector<int32_t> bt2(max_blocks, -1);
+    for (int i = 0; i <= pos; ++i) bt2[i / bsize] = (int32_t)(i / bsize);
+    d.block_tables = bt2;
+    d.slot_mapping = {pos};
+    d.query_seq = {0};
+    d.query_key_len = {pos + 1};
+    d.last_indices = {0};
+    d.max_blocks = max_blocks;
+    auto lg2 = model.forward_logits(d);
+    row = &lg2[0];
+    int t = sample_row(row, config.hf.vocab_size, temperature, top_p, rng,
+                       out.data(), out.size(), rep_penalty, rep_window);
+    if (t == config.eos) break;
+    text += tok.decode_tokens({t});
+    out.push_back(t);
+    ++pos;
+  }
+  return text;
+}
+
 int main(int argc, char** argv) {
   try {
     if (argc < 2) { usage(argv[0]); return 1; }
@@ -90,6 +154,7 @@ int main(int argc, char** argv) {
     int max_model_len = 4096;
     bool server_mode = false;
     bool use_chat = false;
+    bool use_repl = false;
     double temperature = 0.0;
     double top_p = 1.0;
     bool temp_set = false, topp_set = false, maxtok_set = false;  // HF-1: CLI wins over generation_config.json
@@ -106,6 +171,7 @@ int main(int argc, char** argv) {
       if (a == "--max-tokens" && i + 1 < argc) { max_tokens = std::atoi(argv[++i]); maxtok_set = true; }
       else if (a == "--max-model-len" && i + 1 < argc) max_model_len = std::atoi(argv[++i]);
       else if (a == "--chat") use_chat = true;
+      else if (a == "--repl") use_repl = true;
       else if (a == "--system" && i + 1 < argc) system_prompt = argv[++i];
       else if (a == "--temperature" && i + 1 < argc) { temperature = std::atof(argv[++i]); temp_set = true; }
       else if (a == "--top-p" && i + 1 < argc) { top_p = std::atof(argv[++i]); topp_set = true; }
@@ -250,6 +316,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "warning: --chat requested but model has no im_start/im_end specials; using raw prompt\n");
       }
       }
+    }
+    if (use_repl) {
+      // REPL-1: interactive chat loop. Each line is a fresh turn; the shared
+      // KV cache keeps conversational context across turns (out + pos persist).
+      // EOF (Ctrl-D / Ctrl-Z) exits cleanly. No chat template -> raw prompt.
+      std::vector<int> out;
+      int pos = 0;
+      std::mt19937 rng(std::random_device{}());
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        std::vector<int> turn_ids;
+        if (tok.has_chat_template()) turn_ids = tok.encode_text(tok.apply_chat_template(line, system_prompt));
+        else turn_ids = tok.encode_text(line);
+        if (turn_ids.empty()) continue;
+        std::string reply = run_turn(model, config, tok, turn_ids, out, pos,
+                                     temperature, top_p, rep_penalty, rep_window,
+                                     max_tokens, rng);
+        std::printf("%s\n", reply.c_str());
+        std::fflush(stdout);
+      }
+      return 0;
     }
     if (ids.empty()) {
       std::fprintf(stderr, "Prompt encoded to empty token list.\n");

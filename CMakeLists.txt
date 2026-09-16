@@ -113,7 +113,14 @@ target_compile_options(nanovllm_vulkan PRIVATE
     message(STATUS "glslangValidator not found — using prebuilt spv.h")
   endif()
 
-# Vulkan golden/compare test: same model, compares argmax token prefixes vs the reference.
+# AGENT-1 / REAS-1 / GEN-1: header self-tests (each header ships its own
+# main() behind a *_TEST macro; compile each in isolation to run its asserts).
+add_executable(agent_test test/agent_test.cpp)
+target_include_directories(agent_test PRIVATE include)
+add_executable(reason_test test/reason_test.cpp)
+target_include_directories(reason_test PRIVATE include)
+add_executable(gen_test test/gen_test.cpp)
+target_include_directories(gen_test PRIVATE include)
 add_executable(vk_golden_test test/vk_golden_test.cpp src/vulkan_backend.cpp src/vulkan_model.cpp
     src/gguf.cpp src/safetensors.cpp src/tokenizer.cpp)
 target_include_directories(vk_golden_test PRIVATE include test "${Vulkan_INCLUDE_DIR}")

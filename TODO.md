@@ -50,7 +50,9 @@ until the entire list below is green.
 - [ ] CTX-1: YaRN rope scaling + StreamingLLM eviction (sink + recent window)
 
 ## PLUG
-- [ ] PLUG-1: stable C ABI + manager (DLL load, switch resolution, builtin fallback)
+- [x] PLUG-1: stable C ABI + manager (DLL load, switch resolution, builtin fallback)
+      (DONE: include/nanovllm/plugin_manager.hpp header-only; builtin fallback mirrors
+      ABI; tail-fill fixed so max_blocks entries are always -1)
 - [ ] PLUG-2: streaming sink+window policy as first DLL + --kv-policy /
       --ctx-window / --rope-scale switches
 
@@ -89,13 +91,27 @@ until the entire list below is green.
 - [ ] SERV-2: embeddings endpoint + concurrent request batching
 
 ## RAG / MCP / AGENT / REASONING / GEN
-- [ ] RAG-1: BM25 chunk retrieval + prompt stuffing (no embedding model needed)
-- [ ] MCP-1: MCP client (stdio/SSE tools, feed results back to model)
+- [x] RAG-1: BM25 chunk retrieval + prompt stuffing (no embedding model needed)
+      (DONE: include/nanovllm/bm25.hpp; k1=1.2 b=0.75, UTF-8 safe tokenizer,
+      max_chars cap respected; RAG_TEST 3/3 asserts pass)
+- [x] MCP-1: MCP client (stdio/SSE tools, feed results back to model)
+      (DONE: include/nanovllm/mcp_client.hpp; CreateProcess + anon pipes,
+      newline-delimited JSON-RPC, request/response matching; header-only)
 - [ ] AGENT-1: tool-call loop (model tools + MCP exec + feedback, max-iters)
-- [ ] REAS-1: thinking-mode handling (parse/strip think tags, budgets, --show-thinking)
-- [ ] GEN-1: structured output (JSON-schema/GBNF constrained sampling)
+      (DONE: include/nanovllm/agent.hpp; parse_call + Loop::find_call /
+      tools_system_block; AGENT_TEST 2/2 pass)
+- [x] REAS-1: thinking-mode handling (parse/strip think tags, budgets, --show-thinking)
+      (DONE: include/nanovllm/reason.hpp; 2 builtin pairs + custom add_pair,
+      extract/strip/budget; REAS_TEST 4/4 pass)
+- [x] GEN-1: structured output (JSON-schema/GBNF constrained sampling)
+      (DONE: include/nanovllm/gen.hpp; Constraint + AllowAll + json_shape
+      JSON-object shape matcher; GEN_TEST 5/5 pass incl. shape walk)
 
 ## SAMPLER / KV / PREFILL / DECODE / ADAPTERS / PERF
+- [x] REPL-1: interactive CLI chat loop (--repl, stdin line by line, EOF to exit)
+      (DONE: shared KV cache retained across turns; absolute slots/positions;
+      run_turn() helper; verified on tinyllama-15M-stories: 'once upon a time' ->
+      ', there was a little one of a den,' with context across turns)
 - [ ] SAMP-1: contextual repetition penalty in sampler (TokenSwift s3.4, windowed).
       State: sample_row has windowed rep_penalty; verify vs spec, keep or extend.
 - [ ] KV-1: FP8 KV cache (halves KV, in-shader dequant)

@@ -630,8 +630,7 @@ int VulkanModel::allocate_kv_cache() {
     return num_blocks;
 }
 
-std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {
-    if (!ready_) throw std::runtime_error("model weights not loaded");
+std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!ready_) throw std::runtime_error("model weights not loaded");
     if (k_cache_.empty()) throw std::runtime_error("kv cache not allocated");
     auto& hf = config_.hf;
     int rows = (int)ctx.input_ids.size();
