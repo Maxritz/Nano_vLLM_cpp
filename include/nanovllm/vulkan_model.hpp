@@ -84,6 +84,10 @@ public:
     // Returns host logits [out_rows, vocab]. One batched Vulkan submission.
     std::vector<float> forward_logits(const VKContext& ctx);
 
+    // PERF-2: one-line Vulkan heap report (per-heap size + flags) plus the
+    // KV cache usage, for --vram. Reads dev_->rt()->memProps.
+    std::string memory_report() const;
+
     bool ready() const { return ready_; }
 
 private:

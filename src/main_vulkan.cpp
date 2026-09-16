@@ -212,16 +212,7 @@ int main(int argc, char** argv) {
     int num_blocks = model.allocate_kv_cache();
     std::fprintf(stderr, "Loaded model, KV cache blocks: %d\n", num_blocks);
     if (vram_flag) {
-#ifdef _WIN32
-      PROCESS_MEMORY_COUNTERS pmc{};
-      if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
-        std::fprintf(stderr, "[vram] working_set_mb=%.1f kv_blocks=%d vocab=%d hidden=%d layers=%d\n",
-                     pmc.WorkingSetSize / 1048576.0, num_blocks, config.hf.vocab_size,
-                     config.hf.hidden_size, config.hf.num_hidden_layers);
-#else
-      std::fprintf(stderr, "[vram] kv_blocks=%d vocab=%d hidden=%d layers=%d\n",
-                   num_blocks, config.hf.vocab_size, config.hf.hidden_size, config.hf.num_hidden_layers);
-#endif
+      std::fprintf(stderr, "%s\n", model.memory_report().c_str());
     }
 
     std::vector<int> ids = tok.encode_text(prompt);

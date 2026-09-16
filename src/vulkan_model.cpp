@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -826,4 +827,37 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
         for (float& x : out) x = std::tanh(x / c) * c;
     }
     return out;
+}
+
+std::string VulkanModel::memory_report() const {
+  std::ostringstream ss;
+  const VkRT* rt = dev_ ? dev_->rt() : nullptr;
+  if (!rt) return "vram: no runtime\n";
+  const VkPhysicalDeviceMemoryProperties& m = rt->memProps;
+  ss << "vram: device=" << dev_->props().deviceName
+     << " heaps=" << m.memoryHeapCount;
+  for (uint32_t i = 0; i < m.memoryHeapCount; ++i) {
+    const VkMemoryHeap& h = m.memoryHeaps[i];
+    ss << " heap" << i << "=" << (h.size >> 20) << "MB";
+    if (h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ss << "device-local";
+#ifdef VK_MEMORY_HEAP_HOST_VISIBLE_BIT
+    if (h.flags & VK_MEMORY_HEAP_HOST_VISIBLE_BIT) ss << "host-visible";
+#endif
+#ifdef VK_MEMORY_HEAP_HOST_COHERENT_BIT
+    if (h.flags & VK_MEMORY_HEAP_HOST_COHERENT_BIT) ss << "coherent";
+#endif
+#ifdef VK_MEMORY_HEAP_HOST_CACHED_BIT
+    if (h.flags & VK_MEMORY_HEAP_HOST_CACHED_BIT) ss << "cached";
+#endif
+    if (h.flags & ~0xFu) ss << "flags=0x" << std::hex << (h.flags & ~0xFu) << std::dec;
+  }
+  ss << " memTypes=" << m.memoryTypeCount;
+  // KV cache usage: one VBuf per layer for k and v.
+  size_t kv_bytes = 0;
+  for (const auto& b : k_cache_) kv_bytes += b.nbytes;
+  for (const auto& b : v_cache_) kv_bytes += b.nbytes;
+  ss << " kv_cache=" << (kv_bytes >> 20) << "MB"
+     << " blocks=" << num_blocks_ << " block_size=" << block_size_
+     << " layers=" << (int)k_cache_.size();
+  return ss.str();
 }

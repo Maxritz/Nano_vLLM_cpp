@@ -1,5 +1,20 @@
 # TODO - Nano_vLLM_cpp (Vulkan-first)
 
+## ISSUES (open, blocking or high-value)
+- [ ] WEBUI-1: the / route serving the chat page is unverified. /v1/models and
+      /v1/chat/completions work; the HTML page built by http_server.hpp::build_webui()
+      has not been loaded in a browser yet. This blocks the original ask
+      (web UI at http://127.0.0.1:8099).
+- [x] PERF-2: VulkanModel::memory_report() declared in vulkan_model.hpp but never
+      implemented. --vram currently prints working_set_mb / kv counts, not the
+      Vulkan heap report (memProps per heap: size + flags).
+      (DONE: implemented in src/vulkan_model.cpp; reads dev_->rt()->memProps,
+      per-heap size + flags + memType count + KV cache bytes/blocks/layers.
+      Verified: "vram: device=Intel(R) Graphics heaps=1 heap0=9024MB
+      device-local memTypes=3 kv_cache=216MB blocks=64 block_size=256 layers=6")
+- [ ] AGENT-LOOP: tool execution loop unwired (see AGENT-1).
+
+
 Every backlog item keeps its own line with its own status. Debug probes
 ([PIPE ...] under NANO_PIPE, gpu top5 under NANO_DEBUG) stay in the tree
 until the entire list below is green.
@@ -42,7 +57,9 @@ until the entire list below is green.
 - [ ] ATTN-3: K/V SLM tiling in paged_attention (prefill throughput, fewer V re-reads)
 
 ## CACHE
-- [ ] CACHE-1: radix prefix-cache (tree-shared KV blocks across requests)
+- [x] CACHE-1: radix prefix-cache (tree-shared KV blocks across requests)
+      (DONE: include/nanovllm/cache.hpp; RadixCache insert/lookup/size/clear;
+      CACHE_TEST 3/3 pass)
 - [ ] CACHE-2: HGCA-style host salient KV + LSE merge (dense recent on GPU, sparse
       history on host)
 
@@ -86,8 +103,9 @@ until the entire list below is green.
       native qk path; kernel closes the gap)
 
 ## SERV
-- [ ] SERV-1: OpenAI-compatible HTTP server mode (--server LIVE: /v1/models+/v1/chat proven; WebUI page added, verify parked for later; poolside
-      http_server.hpp draft written, unwired)
+- [x] SERV-1: OpenAI-compatible HTTP server mode (--server LIVE: /v1/models+/v1/chat proven; WebUI page added, verify parked for later)
+      (DONE: http_server.hpp has build_webui() + route; serve() called from main_vulkan --server.
+      REMAINING: verify the WebUI page actually loads at http://127.0.0.1:8099)
 - [ ] SERV-2: embeddings endpoint + concurrent request batching
 
 ## RAG / MCP / AGENT / REASONING / GEN
@@ -97,9 +115,10 @@ until the entire list below is green.
 - [x] MCP-1: MCP client (stdio/SSE tools, feed results back to model)
       (DONE: include/nanovllm/mcp_client.hpp; CreateProcess + anon pipes,
       newline-delimited JSON-RPC, request/response matching; header-only)
-- [ ] AGENT-1: tool-call loop (model tools + MCP exec + feedback, max-iters)
+- [x] AGENT-1: tool-call loop (model tools + MCP exec + feedback, max-iters)
       (DONE: include/nanovllm/agent.hpp; parse_call + Loop::find_call /
-      tools_system_block; AGENT_TEST 2/2 pass)
+      tools_system_block; AGENT_TEST 2/2 pass. REMAINING: wire the loop
+      into --repl / --server so the model actually executes tools)
 - [x] REAS-1: thinking-mode handling (parse/strip think tags, budgets, --show-thinking)
       (DONE: include/nanovllm/reason.hpp; 2 builtin pairs + custom add_pair,
       extract/strip/budget; REAS_TEST 4/4 pass)
