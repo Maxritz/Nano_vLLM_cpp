@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "nanovllm/vulkan_model.hpp"
+#include "nanovllm/common.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -259,6 +260,18 @@ void VulkanModel::upload_u16_block(const std::vector<uint16_t>& src, VMatrix& m)
     m.f16 = dev_->make(src, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     m.q8.free(); m.qsc.free(); m.qk.free(); m.qk_segs.clear(); m.is_q8 = false;
 }
+// Q8_0 (34B blocks: fp16 scale + 32 int8) -> F16 host buffer, for mixed-precision fusion.
+static bool q8_to_u16(const std::vector<uint8_t>& q8, std::vector<uint16_t>& u) {
+    if (q8.empty() || q8.size() % 34) return false;
+    u.resize(q8.size() / 34 * 32);
+    for (size_t b = 0, nb = q8.size() / 34; b < nb; ++b) {
+        uint16_t sc; std::memcpy(&sc, &q8[b * 34], 2);
+        float s = fp16_to_float(sc);
+        for (int i = 0; i < 32; ++i)
+            u[b * 32 + i] = float_to_fp16(s * float(static_cast<int8_t>(q8[b * 34 + 2 + i])));
+    }
+    return true;
+}
 void VulkanModel::load_matrix(const std::string& name, VMatrix& m, bool required, size_t n_elements) {
     std::vector<uint8_t> q8;
     if (load_q8(name, q8)) { upload_q8_block(q8, m); m.f16.free(); m.qk.free(); m.qk_segs.clear(); return; }
@@ -321,25 +334,37 @@ void VulkanModel::load_weights() {
             load_matrix_host(p + ".self_attn.q_proj.weight", q_u,qbf,q_q8,q8q,q_qk,qkind,size_t(q_size_)*hidden,true);
             load_matrix_host(p + ".self_attn.k_proj.weight", k_u,kbf,k_q8,k8q,k_qk,kkind,size_t(kv_size_)*hidden,true);
             load_matrix_host(p + ".self_attn.v_proj.weight", v_u,vbf,v_q8,v8q,v_qk,vkind,size_t(kv_size_)*hidden,true);
-            if (q8q||k8q||v8q) {
-                if(!(q8q&&k8q&&v8q)) throw std::runtime_error("mixed Q8 q/k/v unsupported");
+            if (q8q&&k8q&&v8q) {
                 std::vector<uint8_t> f; f.insert(f.end(),q_q8.begin(),q_q8.end());
                 f.insert(f.end(),k_q8.begin(),k_q8.end()); f.insert(f.end(),v_q8.begin(),v_q8.end());
                 upload_q8_block(f, lw.qkv);
-            } else if (qkind||kkind||vkind) {
-                if (!(qkind && kkind && vkind)) {
-                    // Mixed K-quant/non-K-quant: upcast every tensor to F16 host-side
-                    // (load_u16 covers Q2_K/Q4_K/Q6_K/etc via load_upcast_f16) and fuse.
-                    std::vector<uint16_t> f;
-                    auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u) {
-                        if (u.empty()) { bool b = false;
-                            if (!load_u16(n, u, b) || u.empty())
-                                throw std::runtime_error("mixed-precision q/k/v needs F16 for " + n); }
-                        f.insert(f.end(), u.begin(), u.end());
-                    };
-                    fuse_u16(p + ".self_attn.q_proj.weight", q_u);
-                    fuse_u16(p + ".self_attn.k_proj.weight", k_u);
-                    fuse_u16(p + ".self_attn.v_proj.weight", v_u);
+            } else if (qkind&&kkind&&vkind) {
+                size_t qe = size_t(q_size_)*hidden, ke = size_t(kv_size_)*hidden;
+                if (qe%256 || ke%256)
+                    throw std::runtime_error("K-quant q/k/v split off super-block boundary");
+                size_t qb = qe/256*GGUFLoader::qk_block_bytes(qkind);
+                size_t kb = ke/256*GGUFLoader::qk_block_bytes(kkind);
+                size_t vb = ke/256*GGUFLoader::qk_block_bytes(vkind);
+                 std::vector<uint8_t> f; f.insert(f.end(),q_qk.begin(),q_qk.end());
+                 f.insert(f.end(),k_qk.begin(),k_qk.end()); f.insert(f.end(),v_qk.begin(),v_qk.end());
+                  upload_qk_block(f, qkind, lw.qkv);
+                  lw.qkv.qk_segs = {{qkind,0,0},{kkind,qb,qe},{vkind,qb+kb,qe+ke}};
+            } else {
+                // Mixed precisions (Q8 vs K-quant vs upcast/F16): fuse all as F16 host-side.
+                std::vector<uint16_t> f;
+                auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u,
+                                    const std::vector<uint8_t>& q8b) {
+                    if (u.empty()) { bool b = false; load_u16(n, u, b); }
+                    if (u.empty() && !q8b.empty()) q8_to_u16(q8b, u);
+                    if (u.empty())
+                        throw std::runtime_error("mixed-precision q/k/v needs F16 for " + n);
+                    f.insert(f.end(), u.begin(), u.end());
+                };
+                fuse_u16(p + ".self_attn.q_proj.weight", q_u, q_q8);
+                fuse_u16(p + ".self_attn.k_proj.weight", k_u, k_q8);
+                fuse_u16(p + ".self_attn.v_proj.weight", v_u, v_q8);
+                lw.qkv.bf16 = qbf && kbf && vbf && q_q8.empty() && k_q8.empty() && v_q8.empty()
+                              && !qkind && !kkind && !vkind;
                     if (std::getenv("NANO_PIPE") && layer == 0) {
                       auto hf16=[](uint16_t h){uint32_t sign=(h>>15)&1,e=(h>>10)&0x1f,m=h&0x3ff;float val;
                         if(e==0)val=(float)m/16777216.0f*(sign?-1.f:1.f);
@@ -358,22 +383,6 @@ void VulkanModel::load_weights() {
                           std::fprintf(stderr,"] d=%.6f dmin=%.6f\n",(double)hf16((uint16_t)(rb[2*144]|(rb[2*144+1]<<8))),(double)hf16((uint16_t)(rb[2*144+2]|(rb[2*144+3]<<8)))); } }
                     }
                     upload_u16_block(f, lw.qkv);
-                } else {
-                size_t qe = size_t(q_size_)*hidden, ke = size_t(kv_size_)*hidden;
-                if (qe%256 || ke%256)
-                    throw std::runtime_error("K-quant q/k/v split off super-block boundary");
-                size_t qb = qe/256*GGUFLoader::qk_block_bytes(qkind);
-                size_t kb = ke/256*GGUFLoader::qk_block_bytes(kkind);
-                size_t vb = ke/256*GGUFLoader::qk_block_bytes(vkind);
-                 std::vector<uint8_t> f; f.insert(f.end(),q_qk.begin(),q_qk.end());
-                 f.insert(f.end(),k_qk.begin(),k_qk.end()); f.insert(f.end(),v_qk.begin(),v_qk.end());
-                  upload_qk_block(f, qkind, lw.qkv);
-                  lw.qkv.qk_segs = {{qkind,0,0},{kkind,qb,qe},{vkind,qb+kb,qe+ke}};
-                }
-            } else {
-                std::vector<uint16_t> f; f.insert(f.end(),q_u.begin(),q_u.end());
-                f.insert(f.end(),k_u.begin(),k_u.end()); f.insert(f.end(),v_u.begin(),v_u.end());
-                upload_u16_block(f, lw.qkv); lw.qkv.bf16 = qbf && kbf && vbf;
             }
         }
         std::vector<float> qb,kb,vb;
@@ -479,33 +488,31 @@ void VulkanModel::load_weights() {
             std::vector<uint8_t> g_qk,u_qk; int gkind=0,ukind=0;
             load_matrix_host(p + ".mlp.gate_proj.weight", g_u,gbf,g_q8,gq,g_qk,gkind,size_t(inter)*hidden,true);
             load_matrix_host(p + ".mlp.up_proj.weight", u_u,ubf,u_q8,uq,u_qk,ukind,size_t(inter)*hidden,true);
-            if (gq||uq) {
-                if(!(gq&&uq)) throw std::runtime_error("mixed Q8 gate/up unsupported");
+            if (gq&&uq) {
                 std::vector<uint8_t> f; f.insert(f.end(),g_q8.begin(),g_q8.end()); f.insert(f.end(),u_q8.begin(),u_q8.end());
                 upload_q8_block(f, lw.gate_up);
-            } else if (gkind||ukind) {
-                if (!(gkind && ukind && gkind==ukind)) {
-                    std::vector<uint16_t> f;
-                    auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u) {
-                        if (u.empty()) { bool b = false;
-                            if (!load_u16(n, u, b) || u.empty())
-                                throw std::runtime_error("mixed-precision gate/up needs F16 for " + n); }
-                        f.insert(f.end(), u.begin(), u.end());
-                    };
-                    fuse_u16(p + ".mlp.gate_proj.weight", g_u);
-                    fuse_u16(p + ".mlp.up_proj.weight", u_u);
-                    upload_u16_block(f, lw.gate_up);
-                } else {
+            } else if (gkind&&ukind&&gkind==ukind) {
                 if ((size_t(inter)*hidden)%256)
                     throw std::runtime_error("K-quant gate/up split off super-block boundary");
                 size_t gb = size_t(inter)*hidden/256*GGUFLoader::qk_block_bytes(gkind);
                 std::vector<uint8_t> f; f.insert(f.end(),g_qk.begin(),g_qk.end()); f.insert(f.end(),u_qk.begin(),u_qk.end());
                 upload_qk_block(f, gkind, lw.gate_up);
                 lw.gate_up.qk_segs = {{gkind,0,0},{ukind,gb,size_t(inter)*hidden}};
-                }
             } else {
-                std::vector<uint16_t> f; f.insert(f.end(),g_u.begin(),g_u.end()); f.insert(f.end(),u_u.begin(),u_u.end());
-                upload_u16_block(f, lw.gate_up); lw.gate_up.bf16 = gbf && ubf;
+                // Mixed precisions: fuse all as F16 host-side.
+                std::vector<uint16_t> f;
+                auto fuse_u16 = [&](const std::string& n, std::vector<uint16_t>& u,
+                                    const std::vector<uint8_t>& q8b) {
+                    if (u.empty()) { bool b = false; load_u16(n, u, b); }
+                    if (u.empty() && !q8b.empty()) q8_to_u16(q8b, u);
+                    if (u.empty())
+                        throw std::runtime_error("mixed-precision gate/up needs F16 for " + n);
+                    f.insert(f.end(), u.begin(), u.end());
+                };
+                fuse_u16(p + ".mlp.gate_proj.weight", g_u, g_q8);
+                fuse_u16(p + ".mlp.up_proj.weight", u_u, u_q8);
+                upload_u16_block(f, lw.gate_up);
+                lw.gate_up.bf16 = gbf && ubf && g_q8.empty() && u_q8.empty() && !gkind && !ukind;
             }
         }
         if (!(hf.num_experts > 0 && hf.layer_is_moe(layer)))

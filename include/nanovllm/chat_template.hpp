@@ -31,6 +31,7 @@ struct Var {
 struct Ctx {
     const std::vector<Msg>* messages;
     bool add_generation_prompt;
+    std::string eos;  // bound to `eos_token` in templates
     const Msg* msg;
     bool loop_first;
     bool loop_last;
@@ -43,6 +44,7 @@ inline Var lookupVar(const Ctx& ctx, const std::string& name) {
         return r;
     }
     if (name == "add_generation_prompt") return Var::fromBool(ctx.add_generation_prompt);
+    if (name == "eos_token") return Var::fromStr(ctx.eos);
     if (name == "loop") {
         Var r; r.type = Var::Bool; r.b = true; return r;
     }
@@ -78,6 +80,28 @@ inline Var lookupVar(const Ctx& ctx, const std::string& name) {
     Var r; r.type = Var::Bool; r.b = false; return r;
 }
 
+// Rewrite ident['key']/ident["key"] -> ident.key so bracket member access works.
+inline std::string normBrackets(const std::string& in) {
+    std::string out;
+    for (size_t k = 0; k < in.size();) {
+        size_t br = in.find('[', k);
+        if (br == std::string::npos) { out += in.substr(k); break; }
+        size_t q1 = br + 1;
+        if (q1 < in.size() && (in[q1] == '\'' || in[q1] == '"')) {
+            char qc = in[q1];
+            size_t q2 = in.find(qc, q1 + 1);
+            size_t cb = (q2 == std::string::npos) ? std::string::npos : in.find(']', q2 + 1);
+            if (q2 != std::string::npos && cb == q2 + 1) {
+                out += in.substr(k, br - k) + "." + in.substr(q1 + 1, q2 - q1 - 1);
+                k = cb + 1;
+                continue;
+            }
+        }
+        out += in[k++];
+    }
+    return out;
+}
+
 inline std::string evalExpr(const std::string& expr, const Ctx& ctx);
 
 inline std::string evalPrimary(const std::string& e, const Ctx& ctx) {
@@ -87,11 +111,21 @@ inline std::string evalPrimary(const std::string& e, const Ctx& ctx) {
     if (a == std::string::npos) return "";
     s = s.substr(a, b - a + 1);
 
+    auto unescape = [](const std::string& t) {
+        std::string o;
+        for (size_t k = 0; k < t.size(); ++k) {
+            if (t[k] == '\\' && k + 1 < t.size()) {
+                char e = t[++k];
+                o += (e == 'n') ? '\n' : (e == 't') ? '\t' : (e == 'r') ? '\r' : e;
+            } else o += t[k];
+        }
+        return o;
+    };
     if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
-        return s.substr(1, s.size() - 2);
+        return unescape(s.substr(1, s.size() - 2));
     }
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
-        return s.substr(1, s.size() - 2);
+        return unescape(s.substr(1, s.size() - 2));
     }
     if (s == "true") return "true";
     if (s == "false") return "false";
@@ -122,6 +156,7 @@ inline std::string evalExpr(const std::string& expr, const Ctx& ctx) {
     size_t b = s.find_last_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
     s = s.substr(a, b - a + 1);
+    s = normBrackets(s);
 
     size_t ifPos = s.find(" if ");
     if (ifPos != std::string::npos) {
@@ -172,13 +207,45 @@ inline std::string evalExpr(const std::string& expr, const Ctx& ctx) {
 }
 
 inline bool evalCond(const std::string& cond, const Ctx& ctx) {
-    std::string val = evalExpr(cond, ctx);
-    return val == "true";
+    // top-level `or` of `and` chains (quote-aware split); falls back to single expr
+    std::vector<std::vector<std::string>> ors;
+    { char q = 0; size_t start = 0; std::vector<std::string> cur;
+      auto flush = [&](size_t end) { cur.push_back(cond.substr(start, end - start)); };
+      for (size_t k = 0; k < cond.size();) {
+        char c = cond[k];
+        if (q) { if (c == q) q = 0; ++k; continue; }
+        if (c == '\'' || c == '"') { q = c; ++k; continue; }
+        if (cond.compare(k, 4, " or ") == 0) { flush(k); ors.push_back(cur); cur.clear(); k += 4; start = k; continue; }
+        ++k;
+      }
+      flush(cond.size()); ors.push_back(cur); }
+    for (auto& ands : ors) {
+      bool conj = true;
+      for (auto& a : ands) {
+        // split each `or`-arm on ` and `
+        char q = 0; size_t start = 0;
+        for (size_t k = 0; k <= a.size();) {
+          char c = k < a.size() ? a[k] : 0;
+          bool boundary = (k == a.size()) || (!q && a.compare(k, 5, " and ") == 0);
+          if (!boundary) {
+            if (q) { if (c == q) q = 0; }
+            else if (c == '\'' || c == '"') q = c;
+            ++k; continue;
+          }
+          if (evalExpr(a.substr(start, k - start), ctx) != "true") { conj = false; break; }
+          k += 5; start = k;
+        }
+        if (!conj) break;
+      }
+      if (conj) return true;
+    }
+    return false;
 }
 
 } // namespace detail
 
-inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs, bool add_generation_prompt) {
+inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs, bool add_generation_prompt,
+                          const std::string& eos_token = "") {
     using namespace detail;
     std::string out;
     size_t i = 0;
@@ -187,6 +254,7 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
     Ctx ctx;
     ctx.messages = &msgs;
     ctx.add_generation_prompt = add_generation_prompt;
+    ctx.eos = eos_token;
     ctx.msg = nullptr;
     ctx.loop_first = false;
     ctx.loop_last = false;
@@ -297,18 +365,9 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
                                 throw std::runtime_error("Unsupported for iterator: " + iterName);
                             }
                         } else if (tag.rfind("if ", 0) == 0) {
-                            std::string cond = tag.substr(3);
-                            if (evalCond(cond, ctx)) {
-                                parseBlock(ctx);
-                            } else {
-                                skipToTag("endif");
-                            }
-                        } else if (tag == "else") {
-                            skipToTag("endif");
-                        } else if (tag.rfind("elif ", 0) == 0) {
-                            skipToTag("endif");
-                        } else if (tag == "endif") {
-                            return;
+                            parseIf(ctx, tag.substr(3));
+                        } else if (tag == "else" || tag.rfind("elif ", 0) == 0 || tag == "endif") {
+                            return;  // arm terminator: parseIf owns if-chains
                         } else if (tag.rfind("set ", 0) == 0) {
                             std::string rest = tag.substr(4);
                             size_t eqPos = rest.find('=');
@@ -336,8 +395,64 @@ inline std::string render(const std::string& tmpl, const std::vector<Msg>& msgs,
             }
         }
 
-        void skipToTag(const std::string& tagName) {
+        // Scan from i to the next elif/else/endif at depth 0 (nested if/for are
+        // skipped). Leaves i at the tag START, term = tag text. False at EOF.
+        bool scanArm(std::string& term) {
             while (i < n) {
+                if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
+                    size_t save = i;
+                    i += 2;
+                    std::string tag = readTag();
+                    if (tag.rfind("if ", 0) == 0 || tag.rfind("for ", 0) == 0) {
+                        int depth = 1;
+                        while (i < n && depth > 0) {
+                            if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
+                                i += 2;
+                                std::string t2 = readTag();
+                                if (t2.rfind("if ", 0) == 0 || t2.rfind("for ", 0) == 0) depth++;
+                                else if (t2 == "endif" || t2 == "endfor") depth--;
+                            } else i++;
+                        }
+                        continue;
+                    }
+                    if (tag.rfind("elif ", 0) == 0 || tag == "else" || tag == "endif") {
+                        i = save; term = tag; return true;
+                    }
+                } else i++;
+            }
+            return false;
+        }
+
+        // Full if/elif.../else/endif chain with correct arm selection.
+        void parseIf(Ctx& ctx, const std::string& firstCond) {
+            std::string cond = firstCond;
+            for (;;) {
+                size_t armStart = i;
+                std::string term;
+                if (!scanArm(term)) throw std::runtime_error("Unterminated if");
+                i += 2; readTag();  // consume terminator
+                if (term.rfind("elif ", 0) == 0) {
+                    if (evalCond(cond, ctx)) {
+                        i = armStart;
+                        parseBlock(ctx);
+                        skipToTag("endif");
+                        return;
+                    }
+                    cond = term.substr(5);
+                    continue;
+                }
+                if (term == "else") {
+                    if (evalCond(cond, ctx)) { i = armStart; }
+                    parseBlock(ctx);
+                    return;
+                }
+                // endif
+                if (evalCond(cond, ctx)) { i = armStart; parseBlock(ctx); }
+                return;
+            }
+        }
+
+        void skipToTag(const std::string& tagName) {            while (i < n) {
                 if (tmpl[i] == '{' && i + 1 < n && tmpl[i+1] == '%') {
                     i += 2;
                     std::string tag = readTag();

@@ -37,8 +37,8 @@ float qk_q4(uint base, uint i) {
     uint sc, mn;
     if (j < 4u) { sc = wq[b4 + j] & 63u; mn = wq[b4 + j + 4u] & 63u; }
     else { sc = (wq[b4 + j + 4u] & 0xFu) | ((wq[b4 + j - 4u] >> 6) << 4); mn = (wq[b4 + j + 4u] >> 4) | ((wq[b4 + j] >> 6) << 4); }
-    uint qb = wq[base + 16u + j * 16u + (e & 15u)];
-    uint q = (e < 16u) ? (qb & 0xFu) : (qb >> 4);
+    uint qb = wq[base + 16u + (j >> 1) * 32u + e];
+    uint q = (qb >> ((j & 1u) * 4u)) & 0xFu;
     return d * float(sc) * float(q) - dmin * float(mn);
 }
 float qk_q5(uint base, uint i) {

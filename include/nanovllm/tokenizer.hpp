@@ -20,6 +20,8 @@ class Tokenizer {
   std::vector<int> encode_text(const std::string& text) const;
   std::string decode_tokens(const std::vector<int>& ids) const;
   int encode_special(const std::string& special) const;
+  bool has_chat_template() const { return !chat_template_.empty(); }
+  std::string apply_chat_template(const std::string& prompt, const std::string& system = "") const;
   int eos_token_id() const { return eos_id_; }
   int vocab_size() const { return static_cast<int>(id_to_piece_.size()); }
   bool loaded() const { return loaded_; }
@@ -46,6 +48,9 @@ class Tokenizer {
   std::vector<uint32_t> byte_to_codepoint_;
   std::map<uint32_t, unsigned char> codepoint_to_byte_;
   int eos_id_ = -1;
+  int bos_id_ = -1;   // GGUF tokenizer.ggml.bos_token_id
+  bool add_bos_ = false;  // prepend bos at encode (llama.cpp: true for llama-arch when key absent)
+  std::string chat_template_;  // GGUF tokenizer.chat_template (empty = none)
   int fallback_vocab_size_ = 0;
   bool loaded_ = false;
   bool chat_auto_system_ = false;

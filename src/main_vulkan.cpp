@@ -87,12 +87,14 @@ int main(int argc, char** argv) {
     int rep_window = 64;
     std::string server_host = "127.0.0.1";
     int server_port = 8080;
+    std::string system_prompt;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--max-tokens" && i + 1 < argc) { max_tokens = std::atoi(argv[++i]); maxtok_set = true; }
       else if (a == "--max-model-len" && i + 1 < argc) max_model_len = std::atoi(argv[++i]);
       else if (a == "--chat") use_chat = true;
+      else if (a == "--system" && i + 1 < argc) system_prompt = argv[++i];
       else if (a == "--temperature" && i + 1 < argc) { temperature = std::atof(argv[++i]); temp_set = true; }
       else if (a == "--top-p" && i + 1 < argc) { top_p = std::atof(argv[++i]); topp_set = true; }
       else if (a == "--rep-penalty" && i + 1 < argc) rep_penalty = std::atof(argv[++i]);
@@ -137,6 +139,9 @@ int main(int argc, char** argv) {
 
     std::vector<int> ids = tok.encode_text(prompt);
     if (use_chat) {
+      if (tok.has_chat_template()) {
+        ids = tok.encode_text(tok.apply_chat_template(prompt, system_prompt));
+      } else {
       int im_start = tok.encode_special("<|im_start|>");
       int im_end = tok.encode_special("<|im_end|>");
       if (im_start >= 0 && im_end >= 0) {
@@ -160,6 +165,7 @@ int main(int argc, char** argv) {
         ids.swap(c);
       } else {
         std::fprintf(stderr, "warning: --chat requested but model has no im_start/im_end specials; using raw prompt\n");
+      }
       }
     }
     if (ids.empty()) {

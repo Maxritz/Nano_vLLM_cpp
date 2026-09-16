@@ -404,8 +404,7 @@ void dequant_q2_k_block(const uint8_t* blk, float* y) {
 }
 
 // Q4_K: [fp16 d][fp16 dmin][12B scales][128B qs], 256 values (ggml layout:
-// subblock j covers bytes (j>>1)*32, nibble plane (j&1); within the subblock
-// byte l -> element 2l (low nibble plane) and byte l+16 -> element 2l+1).
+// group g covers 32 vals from bytes (g>>1)*32+kk, low nibble if g even).
 void dequant_q4_k_block(const uint8_t* blk, float* y) {
   float d = fp16_to_float(uint16_t(blk[0] | (blk[1] << 8)));
   float dmin = fp16_to_float(uint16_t(blk[2] | (blk[3] << 8)));
@@ -420,9 +419,9 @@ void dequant_q4_k_block(const uint8_t* blk, float* y) {
     }
     float d1 = d * float(sc), m1 = dmin * float(mn);
     int base = (j >> 1) * 32, sh = (j & 1) * 4;
-    for (int l = 0; l < 16; ++l) {
-      y[j * 32 + 2 * l] = d1 * float((blk[16 + base + l] >> sh) & 0xF) - m1;
-      y[j * 32 + 2 * l + 1] = d1 * float((blk[16 + base + 16 + l] >> sh) & 0xF) - m1;
+    for (int kk = 0; kk < 32; ++kk) {
+      int q = (blk[16 + base + kk] >> sh) & 0xF;
+      y[j * 32 + kk] = d1 * float(q) - m1;
     }
   }
 }

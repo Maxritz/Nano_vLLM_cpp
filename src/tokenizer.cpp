@@ -1,4 +1,5 @@
 #include "nanovllm/tokenizer.hpp"
+#include "nanovllm/chat_template.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -314,6 +315,12 @@ bool Tokenizer::load_from_gguf(const std::string& model_dir) {
   finalize_pieces();
   uint32_t eos_id = 0;
   if (g.meta_u32("tokenizer.ggml.eos_token_id", eos_id)) eos_id_ = static_cast<int>(eos_id);
+  uint32_t bid = 0;
+  if (g.meta_u32("tokenizer.ggml.bos_token_id", bid)) bos_id_ = static_cast<int>(bid);
+  if (const GGUFMetaValue* ab = g.meta("tokenizer.ggml.add_bos_token"))
+    add_bos_ = ab->b;
+  else
+    add_bos_ = (tok_model == "llama");  // llama.cpp default when key absent
   if (eos_id_ < 0) {
     auto it = special_id_.find("<|endoftext|>");
     if (it != special_id_.end()) eos_id_ = it->second;
@@ -329,9 +336,27 @@ bool Tokenizer::load_from_gguf(const std::string& model_dir) {
   }
   std::string tmpl;
   bool has_tmpl = g.meta_str("tokenizer.chat_template", tmpl);
+  if (has_tmpl) chat_template_ = tmpl;
   chat_auto_system_ = has_tmpl ? chat_auto_injects_system(tmpl) : false;
   loaded_ = true;
   return true;
+}
+
+std::string Tokenizer::apply_chat_template(const std::string& prompt, const std::string& system) const {
+  if (chat_template_.empty()) return prompt;
+  try {
+    std::string eos;
+    if (eos_id_ >= 0 && eos_id_ < static_cast<int>(id_to_piece_.size()))
+      eos = id_to_piece_[(size_t)eos_id_];
+    std::vector<std::pair<std::string, std::string>> conv;
+    if (!system.empty()) conv.push_back({"system", system});
+    conv.push_back({"user", prompt});
+    std::vector<chtmpl::Msg> msgs;
+    for (auto& kv : conv) msgs.push_back({kv.first, kv.second});
+    return chtmpl::render(chat_template_, msgs, true, eos);
+  } catch (...) {
+    return prompt;  // malformed template: raw prompt, same as before
+  }
 }
 
 void Tokenizer::note_pretok_fallback(const std::string& detail) {
@@ -755,6 +780,8 @@ std::vector<int> Tokenizer::encode_text(const std::string& text) const {
     }
     i = j;
   }
+  if (add_bos_ && bos_id_ >= 0 && (ids.empty() || ids[0] != bos_id_))
+    ids.insert(ids.begin(), bos_id_);
   return ids;
 }
 

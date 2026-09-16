@@ -157,9 +157,9 @@ struct WL {
               }
               float d1 = d * sc, m1 = dmin * mn;
               int base = (j >> 1) * 32, sh = (j & 1) * 4;
-              for (int l = 0; l < 16; ++l) {
-                out[b * 256 + j * 32 + 2 * l] = d1 * ((blk[16 + base + l] >> sh) & 0xF) - m1;
-                out[b * 256 + j * 32 + 2 * l + 1] = d1 * ((blk[16 + base + 16 + l] >> sh) & 0xF) - m1;
+              for (int kk = 0; kk < 32; ++kk) {
+                int q = (blk[16 + base + kk] >> sh) & 0xF;
+                out[b * 256 + j * 32 + kk] = d1 * (float)q - m1;
               }
             }
           } else if (kind == 13) {  // Q5_K: [d][dmin][12B scales][32B qh][128B qs]

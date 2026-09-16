@@ -12,7 +12,7 @@ until the entire list below is green.
 - [ ] VERIFY workers: full build + MoE/dense/ATTN/TOK/QUANT golden matrix
       (IN PROGRESS: mixed-fuse fix + Q4_K canonical fix landed; GPU top5 == CPU
       ref top5 on tinyllama-q2k; matrix re-run pending after BOS fix)
-- [ ] BOS prepend (NEW P0, root cause CONFIRMED): tokenizer.cpp load_gguf reads
+- [x] BOS prepend (NEW P0, root cause CONFIRMED): tokenizer.cpp load_gguf reads
       bos_token_id=1 but never prepends; GGUF omits add_bos_token => llama-arch
       default must be TRUE. Probe: ref+BOS flips top1 8111(vector)->22168.
       Fix: store add_bos_/bos_id_, prepend in encode_text. Test: tok_probe ids[0]==1.
@@ -60,7 +60,7 @@ until the entire list below is green.
 - [ ] TOK-2: honor pre_tokenizer config from tokenizer.json (TikToken-style splits).
       State: poolside pre_tokenizer.hpp green (POSIX->ECMA + Isolated glue); WIRE
       GGUF tokenizer.ggml.pre=default -> llama regex.
-- [ ] TOK-3: Jinja-lite chat-template renderer (loops/conditionals/roles). State:
+- [x] TOK-3: Jinja-lite chat-template renderer (loops/conditionals/roles). State:
       chat_template.hpp tests green; WIRE into --chat incl. zephyr user/assistant
       specials (engine only knows im_start/im_end today).
 
