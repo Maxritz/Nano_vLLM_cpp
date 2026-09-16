@@ -121,6 +121,15 @@ add_executable(reason_test test/reason_test.cpp)
 target_include_directories(reason_test PRIVATE include)
 add_executable(gen_test test/gen_test.cpp)
 target_include_directories(gen_test PRIVATE include)
+add_executable(lora_test test/lora_test.cpp src/gguf.cpp)
+target_include_directories(lora_test PRIVATE include)
+target_compile_options(lora_test PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/O2 /wd4100 /wd4101>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations>)
+add_executable(drafter_test test/drafter_test.cpp)
+target_include_directories(drafter_test PRIVATE include)
+add_executable(cache_test test/cache_test.cpp)
+target_include_directories(cache_test PRIVATE include)
 add_executable(vk_golden_test test/vk_golden_test.cpp src/vulkan_backend.cpp src/vulkan_model.cpp
     src/gguf.cpp src/safetensors.cpp src/tokenizer.cpp)
 target_include_directories(vk_golden_test PRIVATE include test "${Vulkan_INCLUDE_DIR}")

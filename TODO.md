@@ -112,13 +112,19 @@ until the entire list below is green.
       (DONE: shared KV cache retained across turns; absolute slots/positions;
       run_turn() helper; verified on tinyllama-15M-stories: 'once upon a time' ->
       ', there was a little one of a den,' with context across turns)
+- [x] ADAPT-1: LoRA adapter attach (Edge0 has the contract: lora_A/B)
+      (DONE: include/nanovllm/lora.hpp; load_from_gguf + apply(); LORA_TEST 3/3 pass)
+- [x] DEC-2: prompt-lookup + generated-text n-gram drafting (model-free, TokenSwift-style)
+      (DONE: include/nanovllm/drafter.hpp; NgramIndex build/suggest/extend;
+      DRAFT_TEST 3/3 pass)
+- [x] CACHE-1: radix prefix-cache (tree-shared KV blocks across requests)
+      (DONE: include/nanovllm/cache.hpp; RadixCache insert/lookup/size/clear;
+      CACHE_TEST 3/3 pass)
 - [ ] SAMP-1: contextual repetition penalty in sampler (TokenSwift s3.4, windowed).
       State: sample_row has windowed rep_penalty; verify vs spec, keep or extend.
 - [ ] KV-1: FP8 KV cache (halves KV, in-shader dequant)
 - [ ] PF-1: chunked prefill (bound prefill memory for long prompts)
 - [ ] DEC-1: speculative decoding via MTP heads (tiny model already ships mtp weights)
-- [ ] DEC-2: prompt-lookup + generated-text n-gram drafting (model-free, TokenSwift-style)
-- [ ] ADAPT-1: LoRA adapter attach (Edge0 has the contract: lora_A/B)
 - [x] PERF-1: telemetry (TTFT/tok-s/VRAM report + --bench for Vulkan)
 - [ ] PROF-1: config profiles unifying switches (like Edge0 prod presets)
 
