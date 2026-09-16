@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -19,6 +20,7 @@
 #include "nanovllm/config.hpp"
 #include "nanovllm/tokenizer.hpp"
 #include "nanovllm/vulkan_model.hpp"
+#include "nanovllm/agent.hpp"
 
 static void usage(const char* prog) {
   std::fprintf(stderr, "Usage: %s <model_dir> [prompt] [--max-tokens N] [--max-model-len N]\n", prog);
@@ -145,6 +147,34 @@ static std::string run_turn(VulkanModel& model, const Config& config, const Toke
   return text;
 }
 
+// AGENT-1: tool executor. `name=cmd` registers a shell command; the agent loop
+// parses a tool call from the model's reply, runs the matching command with
+// the JSON args piped to its stdin, and feeds stdout back as the next user
+// turn. No tool found -> the reply is final text.
+struct ToolExec {
+  std::string name, cmd;
+};
+static std::string run_tool(const std::vector<ToolExec>& tools,
+                            const agent::Call& call) {
+  for (const auto& t : tools) {
+    if (t.name == call.name) {
+      std::string cmd = t.cmd + " 2>&1";
+      FILE* p = _popen(cmd.c_str(), "w");
+      if (!p) return std::string("[tool error] cannot run ") + t.name;
+      if (!call.args.empty()) std::fputs(call.args.c_str(), p);
+      std::fclose(p);
+      // Re-run capturing output.
+      p = _popen(cmd.c_str(), "r");
+      if (!p) return std::string("[tool error] cannot run ") + t.name;
+      std::string out; char buf[4096];
+      while (std::fgets(buf, sizeof(buf), p)) out += buf;
+      std::fclose(p);
+      return out;
+    }
+  }
+  return std::string("[tool error] unknown tool: ") + call.name;
+}
+
 int main(int argc, char** argv) {
   try {
     if (argc < 2) { usage(argv[0]); return 1; }
@@ -165,6 +195,8 @@ int main(int argc, char** argv) {
     std::string system_prompt;
     int bench_runs = 0;   // PERF-1: repeat generation N times, report averages
     bool vram_flag = false;
+    std::string tools_spec;          // AGENT-1: "name=cmd,name=cmd,..."
+    int max_iters = 0;               // AGENT-1: 0 = no tool loop
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -179,6 +211,8 @@ int main(int argc, char** argv) {
       else if (a == "--rep-window" && i + 1 < argc) rep_window = std::atoi(argv[++i]);
       else if (a == "--bench" && i + 1 < argc) bench_runs = std::atoi(argv[++i]);
       else if (a == "--vram") vram_flag = true;
+      else if (a == "--tools" && i + 1 < argc) tools_spec = argv[++i];
+      else if (a == "--max-iters" && i + 1 < argc) max_iters = std::atoi(argv[++i]);
       else if (a == "--server") server_mode = true;
       else if (server_mode && server_host == "127.0.0.1" && argv[i][0] != '-') {
         if (strchr(argv[i], '.')) server_host = argv[i];
@@ -312,6 +346,29 @@ int main(int argc, char** argv) {
       // REPL-1: interactive chat loop. Each line is a fresh turn; the shared
       // KV cache keeps conversational context across turns (out + pos persist).
       // EOF (Ctrl-D / Ctrl-Z) exits cleanly. No chat template -> raw prompt.
+      // AGENT-1: --tools name=cmd,... + --max-iters N enables a tool-call loop:
+      // after each reply we scan for a fenced/bare tool call, execute the
+      // matching command with the JSON args on stdin, and feed stdout back as
+      // the next user turn, up to N iterations.
+      std::vector<ToolExec> tools;
+      if (!tools_spec.empty()) {
+        std::istringstream ts(tools_spec);
+        std::string item;
+        while (std::getline(ts, item, ',')) {
+          auto eq = item.find('=');
+          if (eq != std::string::npos && eq + 1 < item.size())
+            tools.push_back({item.substr(0, eq), item.substr(eq + 1)});
+        }
+      }
+      agent::Loop agloop;
+      for (const auto& t : tools) {
+        agent::Tool at;
+        at.name = t.name;
+        at.schema = "{}";
+        agloop.add_tool(at);
+      }
+      std::string sys_block = agloop.tools_system_block();
+
       std::vector<int> out;
       int pos = 0;
       std::mt19937 rng(std::random_device{}());
@@ -319,12 +376,32 @@ int main(int argc, char** argv) {
       while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
         std::vector<int> turn_ids;
-        if (tok.has_chat_template()) turn_ids = tok.encode_text(tok.apply_chat_template(line, system_prompt));
-        else turn_ids = tok.encode_text(line);
+        std::string prompt_text = line;
+        if (!sys_block.empty()) prompt_text = sys_block + "\n" + line;
+        if (tok.has_chat_template()) turn_ids = tok.encode_text(tok.apply_chat_template(prompt_text, system_prompt));
+        else turn_ids = tok.encode_text(prompt_text);
         if (turn_ids.empty()) continue;
         std::string reply = run_turn(model, config, tok, turn_ids, out, pos,
                                      temperature, top_p, rep_penalty, rep_window,
                                      max_tokens, rng);
+        // AGENT-1: tool-call loop.
+        int iters = 0;
+        while (max_iters > 0 && iters < max_iters) {
+          size_t next_off = 0;
+          agent::Call c = agloop.find_call(reply, next_off);
+          if (c.name.empty()) break;
+          std::fprintf(stderr, "[tool] %s %s\n", c.name.c_str(), c.args.c_str());
+          std::string result = run_tool(tools, c);
+          std::string feed = std::string("Tool ") + c.name + " returned:\n" + result;
+          std::vector<int> fids;
+          if (tok.has_chat_template()) fids = tok.encode_text(tok.apply_chat_template(feed, system_prompt));
+          else fids = tok.encode_text(feed);
+          if (fids.empty()) break;
+          reply = run_turn(model, config, tok, fids, out, pos,
+                           temperature, top_p, rep_penalty, rep_window,
+                           max_tokens, rng);
+          ++iters;
+        }
         std::printf("%s\n", reply.c_str());
         std::fflush(stdout);
       }
