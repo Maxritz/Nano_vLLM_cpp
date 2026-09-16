@@ -1,5 +1,23 @@
 #include "nanovllm/tokenizer.hpp"
 #include "nanovllm/chat_template.hpp"
+#include "nanovllm/pre_tokenizer.hpp"
+
+// TOK-2: apply an HF Split/Regex stage via the tested ptok implementation
+// (POSIX classes translated; \p{...} patterns throw inside ptok and degrade
+// to no-split for that piece instead of failing the load).
+static std::vector<std::string> regex_split_piece(const std::string& pattern,
+                                                  const std::string& behavior,
+                                                  const std::string& text) {
+  auto js = [](const std::string& x) { ptok::JVal v; v.t = ptok::JVal::STR; v.s = x; return v; };
+  ptok::JVal pat; pat.t = ptok::JVal::OBJ; pat.obj = {{"Regex", js(pattern)}};
+  ptok::JVal mk; mk.t = ptok::JVal::OBJ;
+  mk.obj = {{"type", js("Split")}, {"pattern", pat}, {"behavior", js(behavior)}};
+  try {
+    return ptok::pre_split(mk, text);
+  } catch (...) {
+    return {text};
+  }
+}
 
 #include <algorithm>
 #include <cstdio>
@@ -396,7 +414,15 @@ bool Tokenizer::collect_pre_stages(const Json& j, std::vector<PreStage>& out) {
     } else if (p.is_object()) {
       if (p.contains("String") && p.at("String").is_string()) pat = p.at("String").as_string();
       else if (p.contains("string") && p.at("string").is_string()) pat = p.at("string").as_string();
-      else return false;  // {"Regex": ...} and friends are unsupported
+      else if (p.contains("Regex") && p.at("Regex").is_string()) {
+        PreStage s;
+        s.kind = PreKind::Regex;
+        s.pattern = p.at("Regex").as_string();
+        if (j.contains("behavior") && j.at("behavior").is_string())
+          s.behavior = j.at("behavior").as_string();
+        out.push_back(s);
+        return true;
+      } else return false;  // unknown pattern object
     } else {
       return false;
     }
@@ -536,7 +562,8 @@ std::vector<std::string> Tokenizer::pretokenize_raw(const std::string& text) con
     if (s.kind == PreKind::ByteLevel) continue;  // byte mapping happens in pretokenize()
     std::vector<std::string> next;
     for (const auto& p : pieces) {
-      auto sp = (s.kind == PreKind::SplitWS) ? split_keep_ws(p) : split_keep_str(p, s.ch);
+      auto sp = (s.kind == PreKind::Regex) ? regex_split_piece(s.pattern, s.behavior, p)
+                : ((s.kind == PreKind::SplitWS) ? split_keep_ws(p) : split_keep_str(p, s.ch));
       next.insert(next.end(), sp.begin(), sp.end());
     }
     pieces.swap(next);

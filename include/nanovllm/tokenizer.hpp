@@ -67,10 +67,12 @@ class Tokenizer {
 
   // TOK-2 (pre_tokenizer config from tokenizer.json). Empty = absent/unknown ->
   // built-in default split.
-  enum class PreKind { ByteLevel, SplitWS, SplitChar };
+  enum class PreKind { ByteLevel, SplitWS, SplitChar, Regex };
   struct PreStage {
     PreKind kind = PreKind::ByteLevel;
     std::string ch;  // SplitChar separator (single char)
+    std::string pattern;   // Regex (ECMAScript, POSIX classes OK; \p{...} degrades)
+    std::string behavior = "Isolated";  // Split behavior passthrough
     bool add_prefix_space = false;
   };
   std::vector<PreStage> pretokenizer_;

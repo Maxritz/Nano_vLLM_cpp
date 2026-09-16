@@ -1,4 +1,6 @@
+#define NOMINMAX
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -6,6 +8,11 @@
 #include <random>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 
 #include "nanovllm/config.hpp"
 #include "nanovllm/tokenizer.hpp"
@@ -15,6 +22,7 @@ static void usage(const char* prog) {
   std::fprintf(stderr, "Usage: %s <model_dir> [prompt] [--max-tokens N] [--max-model-len N]\n", prog);
   std::fprintf(stderr, "       [--chat] [--temperature T] [--top-p P]\n");
   std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W]\n");
+  std::fprintf(stderr, "       [--bench N] [--vram]\n");
   std::fprintf(stderr, "        <model_dir> --server [host] [port]\n");
   std::fprintf(stderr, "  Sampling defaults come from generation_config.json when present;\n");
   std::fprintf(stderr, "  explicit flags always win. --rep-penalty divides the logits of ids\n");
@@ -88,6 +96,8 @@ int main(int argc, char** argv) {
     std::string server_host = "127.0.0.1";
     int server_port = 8080;
     std::string system_prompt;
+    int bench_runs = 0;   // PERF-1: repeat generation N times, report averages
+    bool vram_flag = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -99,6 +109,8 @@ int main(int argc, char** argv) {
       else if (a == "--top-p" && i + 1 < argc) { top_p = std::atof(argv[++i]); topp_set = true; }
       else if (a == "--rep-penalty" && i + 1 < argc) rep_penalty = std::atof(argv[++i]);
       else if (a == "--rep-window" && i + 1 < argc) rep_window = std::atoi(argv[++i]);
+      else if (a == "--bench" && i + 1 < argc) bench_runs = std::atoi(argv[++i]);
+      else if (a == "--vram") vram_flag = true;
       else if (a == "--server") server_mode = true;
       else if (server_mode && server_host == "127.0.0.1" && argv[i][0] != '-') {
         if (strchr(argv[i], '.')) server_host = argv[i];
@@ -136,6 +148,18 @@ int main(int argc, char** argv) {
     model.alloc_expert_slots();
     int num_blocks = model.allocate_kv_cache();
     std::fprintf(stderr, "Loaded model, KV cache blocks: %d\n", num_blocks);
+    if (vram_flag) {
+#ifdef _WIN32
+      PROCESS_MEMORY_COUNTERS pmc{};
+      if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        std::fprintf(stderr, "[vram] working_set_mb=%.1f kv_blocks=%d vocab=%d hidden=%d layers=%d\n",
+                     pmc.WorkingSetSize / 1048576.0, num_blocks, config.hf.vocab_size,
+                     config.hf.hidden_size, config.hf.num_hidden_layers);
+#else
+      std::fprintf(stderr, "[vram] kv_blocks=%d vocab=%d hidden=%d layers=%d\n",
+                   num_blocks, config.hf.vocab_size, config.hf.hidden_size, config.hf.num_hidden_layers);
+#endif
+    }
 
     std::vector<int> ids = tok.encode_text(prompt);
     if (use_chat) {
@@ -184,6 +208,20 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int pos = (int)ids.size();
 
+    // PERF-1: optional --bench loop (fresh KV each run); timings averaged.
+    int runs = bench_runs > 0 ? bench_runs : 1;
+    double sum_ttft = 0, sum_dec = 0;
+    int sum_ntok = 0, sum_nprompt = 0;
+    for (int br = 0; br < runs; ++br) {
+      out.clear();
+      pos = (int)ids.size();
+      if (br > 0) model.allocate_kv_cache();
+      const bool quiet = br > 0;
+      using clk = std::chrono::steady_clock;
+      auto t0 = clk::now();
+      clk::time_point t1 = t0;
+      bool done = false;
+
     // Prefill
     {
       VKContext ctx;
@@ -212,17 +250,15 @@ int main(int argc, char** argv) {
       }
       int nxt = sample_row(row, config.hf.vocab_size, temperature, top_p, rng, out.data(), out.size(),
                            rep_penalty, rep_window);
-      std::fprintf(stderr, "prefill next=%d\n", nxt);
-      std::printf("%s", tok.decode_tokens({nxt}).c_str());
+      t1 = clk::now();
+      if (!quiet) std::fprintf(stderr, "prefill next=%d\n", nxt);
+      if (!quiet) std::printf("%s", tok.decode_tokens({nxt}).c_str());
       out.push_back(nxt);
-      if (nxt == config.eos || (int)out.size() >= max_tokens) {
-        std::printf("\n");
-        return 0;
-      }
-    }
-
-    // Decode loop
-    while ((int)out.size() < max_tokens) {
+      done = (nxt == config.eos || (int)out.size() >= max_tokens);
+      }  // end prefill
+      if (!done) {
+      // Decode loop
+      while ((int)out.size() < max_tokens) {
       VKContext d;
       d.input_ids = {out.back()};
       d.positions = {pos};
@@ -239,12 +275,22 @@ int main(int argc, char** argv) {
       int t = sample_row(row, config.hf.vocab_size, temperature, top_p, rng, out.data(), out.size(), rep_penalty,
                          rep_window);
       if (t == config.eos) break;
-      std::printf("%s", tok.decode_tokens({t}).c_str());
-      std::fflush(stdout);
+      if (!quiet) std::printf("%s", tok.decode_tokens({t}).c_str());
+      if (!quiet) std::fflush(stdout);
       out.push_back(t);
       ++pos;
     }
-    std::printf("\n");
+    }  // end decode (skipped when prefill finished the run)
+    auto t2 = clk::now();
+    sum_ttft += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    sum_dec += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    sum_ntok += (int)out.size() > 0 ? (int)out.size() - 1 : 0;
+    sum_nprompt += (int)ids.size();
+    }  // end bench loop
+    if (!bench_runs) std::printf("\n");
+    std::fprintf(stderr, "[perf] ttft_ms=%.2f decode_tok_s=%.2f prompt_tok_s=%.2f runs=%d\n",
+                 sum_ttft / runs, sum_dec > 0 ? 1000.0 * sum_ntok / sum_dec : 0.0,
+                 sum_ttft > 0 ? 1000.0 * sum_nprompt / sum_ttft : 0.0, runs);
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "Error: %s\n", e.what());

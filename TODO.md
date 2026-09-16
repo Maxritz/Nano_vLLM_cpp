@@ -57,7 +57,7 @@ until the entire list below is green.
 - [ ] TOK-1: SPM-Unigram Viterbi decode/encode (Gemma/Llama SPM models). State:
       engine encode_unigram proven == sentencepiece golden on tinyllama; poolside
       spm_tokenizer.hpp header also green. Close after VERIFY or keep as fallback.
-- [ ] TOK-2: honor pre_tokenizer config from tokenizer.json (TikToken-style splits).
+- [x] TOK-2: honor pre_tokenizer config from tokenizer.json (TikToken-style splits).
       State: poolside pre_tokenizer.hpp green (POSIX->ECMA + Isolated glue); WIRE
       GGUF tokenizer.ggml.pre=default -> llama regex.
 - [x] TOK-3: Jinja-lite chat-template renderer (loops/conditionals/roles). State:
@@ -102,7 +102,7 @@ until the entire list below is green.
 - [ ] DEC-1: speculative decoding via MTP heads (tiny model already ships mtp weights)
 - [ ] DEC-2: prompt-lookup + generated-text n-gram drafting (model-free, TokenSwift-style)
 - [ ] ADAPT-1: LoRA adapter attach (Edge0 has the contract: lora_A/B)
-- [ ] PERF-1: telemetry (TTFT/tok-s/VRAM report + --bench for Vulkan)
+- [x] PERF-1: telemetry (TTFT/tok-s/VRAM report + --bench for Vulkan)
 - [ ] PROF-1: config profiles unifying switches (like Edge0 prod presets)
 
 ## Verified this session (evidence trail)
