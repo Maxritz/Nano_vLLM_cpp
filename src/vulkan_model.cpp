@@ -313,6 +313,10 @@ void VulkanModel::load_weights() {
             apply_gguf_moe_meta(gg_loader_, config_.hf);  // MoE counts live in GGUF KV
         if (has_moe && hf.num_experts <= 0)
            throw std::runtime_error("MoE weights present but config has num_experts=0");
+        for (auto& n : names)
+          if (n.find("ssm_") != std::string::npos || n.find(".ssm.") != std::string::npos ||
+              n.find("mamba") != std::string::npos)
+            throw std::runtime_error("SSM/mamba hybrid layers are unsupported (file: " + n + ")");
     }
     if (!contains("model.embed_tokens.weight") && !contains("model.language_model.embed_tokens.weight"))
         throw std::runtime_error("model.embed_tokens.weight not found");
