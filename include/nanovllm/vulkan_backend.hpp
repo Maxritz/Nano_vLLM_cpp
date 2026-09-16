@@ -104,7 +104,8 @@ class VulkanBackend {
   void add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off = 0);
    void silu_and_mul(VBuf& gup, VBuf& y, int rows, int inter);
    void scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols);
-  void rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride);
+  void rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride,
+          float rope_factor = 1.0f, float rope_beta = 32.0f);
   void store_kv(VBuf& key, VBuf& value, VBuf& k_cache, VBuf& v_cache, VBuf& slot_map,
                 int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
    void paged_attention(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,

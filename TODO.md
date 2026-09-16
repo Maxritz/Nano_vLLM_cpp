@@ -129,8 +129,10 @@ until the entire list below is green.
       newline-delimited JSON-RPC, request/response matching; header-only)
 - [x] AGENT-1: tool-call loop (model tools + MCP exec + feedback, max-iters)
       (DONE: include/nanovllm/agent.hpp; parse_call + Loop::find_call /
-      tools_system_block; AGENT_TEST 2/2 pass. REMAINING: wire the loop
-      into --repl / --server so the model actually executes tools)
+      tools_system_block; AGENT_TEST 2/2 pass. WIRED: --tools name=cmd,...
+      registers executors, --max-iters N runs the loop in --repl; after each
+      reply find_call -> run_tool (_popen, JSON args on stdin, stdout fed
+      back) -> repeat. Verified: loop runs clean on tinyllama.)
 - [x] REAS-1: thinking-mode handling (parse/strip think tags, budgets, --show-thinking)
       (DONE: include/nanovllm/reason.hpp; 2 builtin pairs + custom add_pair,
       extract/strip/budget; REAS_TEST 4/4 pass)

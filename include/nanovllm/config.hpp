@@ -40,6 +40,12 @@ struct HFConfig {
   int max_position_embeddings = 4096;
   int head_dim = 0;
   double rope_theta = 1000000.0;
+  // CTX-1: YaRN rope scaling. rope_factor>1 scales long positions down so a
+  // model trained at 4K can attend at 32K. beta is the YaRN break point.
+  double rope_factor = 1.0;
+  double rope_beta = 32.0;
+  // ATTN-4: mRoPE dimension sections (qwen3 text path). Empty = plain rotary.
+  std::vector<int> rope_dim_sections;
   double rms_norm_eps = 1e-6;
   int sliding_window = 0;               // 0 = full attention (Gemma SWA sets N)
   std::vector<char> sliding_window_pattern;  // per-layer SWA flag (empty = uniform)
@@ -120,6 +126,10 @@ struct HFConfig {
     if (cfg->contains("rope_scaling") && cfg->at("rope_scaling").is_object()) {
       const auto& rs = cfg->at("rope_scaling");
       if (rs.contains("rope_theta")) c.rope_theta = rs.at("rope_theta").as_number();
+      if (rs.contains("rope_factor")) c.rope_factor = rs.at("rope_factor").as_number();
+      if (rs.contains("beta")) c.rope_beta = rs.at("beta").as_number();
+      // ATTN-4 (mrope dim_sections) is blocked on SSM+mRoPE; plain rotary is
+      // the default here and stays empty.
     }
     return c;
   }

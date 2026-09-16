@@ -143,6 +143,11 @@ VulkanModel::VulkanModel(const Config& config) : config_(config) {
         inv_freq[i] = static_cast<float>(1.0 / std::pow(hf.rope_theta, (2.0 * i) / hf.head_dim));
     dev_ = VulkanBackend::Create(true);
     inv_freq_ = dev_->make(inv_freq);
+    if (getenv("NANO_DEBUG")) {
+        std::fprintf(stderr, "[T] rope head_dim=%d theta=%.1f factor=%.3f beta=%.1f inv_freq[0]=%.6f\n",
+                     hf.head_dim, hf.rope_theta, hf.rope_factor, hf.rope_beta, inv_freq[0]);
+        std::fflush(stderr);
+    }
 }
 VulkanModel::~VulkanModel() = default;
 
@@ -691,8 +696,15 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
         if (lw.q_norm.nbytes) dev_->rms_norm(q_dev, lw.q_norm, q_dev, rows * heads, head_dim, eps);
         if (lw.k_norm.nbytes) dev_->rms_norm(k_dev, lw.k_norm, k_dev, rows * kv_heads, head_dim, eps);
         if (layer == 0) { pipe_tag("L0.q", q_dev, (size_t)rows * q_size_); pipe_tag("L0.k", k_dev, (size_t)rows * kv_size_); pipe_tag("L0.v", v_dev, (size_t)rows * kv_size_); }
-        dev_->rope(q_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_);
-        dev_->rope(k_dev, d_pos, inv_freq_, rows, kv_heads, head_dim, kv_size_);
+        // CTX-1: pass YaRN scaling through to the rope shader; factor==1 is a
+        // no-op (lambda==1), so unconfigured models are bit-identical.
+        const float rf = (float)hf.rope_factor, rb = (float)hf.rope_beta;
+        if (getenv("NANO_DEBUG") && layer == 0) {
+            std::fprintf(stderr, "[T] rope L0 factor=%.3f beta=%.1f theta=%.1f\n", rf, rb, hf.rope_theta);
+            std::fflush(stderr);
+        }
+        dev_->rope(q_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_, rf, rb);
+        dev_->rope(k_dev, d_pos, inv_freq_, rows, kv_heads, head_dim, kv_size_, rf, rb);
         if (layer == 0) { pipe_tag("L0.qrope", q_dev, (size_t)rows * q_size_); pipe_tag("L0.krope", k_dev, (size_t)rows * kv_size_); }
         int d = kv_heads * head_dim;
         if (d_slot.buffer && !ctx.slot_mapping.empty())

@@ -645,9 +645,10 @@ void VulkanBackend::scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols) {
     BufBind bufs[2] = { {0, x.buffer, 0, 0}, {1, s.buffer, 0, 0} };
     dispatch("scale_sigmoid", &pc, sizeof(pc), bufs, 2, rows, 1, 1);
 }
-void VulkanBackend::rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride) {
+void VulkanBackend::rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride,
+                         float rope_factor, float rope_beta) {
     int total = tokens * heads * (head_dim/2); if (total <= 0) return;
-    struct PC { int tokens, heads, head_dim; int64_t stride; } pc{ tokens, heads, head_dim, stride };
+    struct PC { int tokens, heads, head_dim; int64_t stride; float rope_factor; float rope_beta; float rope_theta; } pc{ tokens, heads, head_dim, stride, rope_factor, rope_beta, 0.0f };
     BufBind bufs[3] = { {0, data.buffer, 0, 0}, {1, pos.buffer, 0, 0}, {2, inv_freq.buffer, 0, 0} };
     dispatch("rope", &pc, sizeof(pc), bufs, 3, ru(total,256)/256, 1, 1);
 }
