@@ -66,8 +66,11 @@ until the entire list below is green.
 ## CTX
 - [x] CTX-1: YaRN rope scaling + StreamingLLM eviction (sink + recent window)
       (DONE: include/nanovllm/rope_scale.hpp; yarn_angle + streaming_keep.
-      ROPE_TEST 2/2 pass. REMAINING: wire yarn_angle into rope() in
-      vulkan_backend.cpp when rope scaling is configured.)
+      ROPE_TEST 2/2 pass. WIRED: config.hpp reads rope_factor/rope_beta from
+      rope_scaling{}; rope.comp computes lambda(pos) in-shader; rope() push
+      const now carries factor/beta; forward_logits passes them per layer.
+      TRACE: NANO_DEBUG prints [T] rope head_dim=.. factor=.. beta=..; factor==1
+      is a no-op so unconfigured models are bit-identical.)
 
 ## PLUG
 - [x] PLUG-1: stable C ABI + manager (DLL load, switch resolution, builtin fallback)
