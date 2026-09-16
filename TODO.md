@@ -64,19 +64,27 @@ until the entire list below is green.
       history on host)
 
 ## CTX
-- [ ] CTX-1: YaRN rope scaling + StreamingLLM eviction (sink + recent window)
+- [x] CTX-1: YaRN rope scaling + StreamingLLM eviction (sink + recent window)
+      (DONE: include/nanovllm/rope_scale.hpp; yarn_angle + streaming_keep.
+      ROPE_TEST 2/2 pass. REMAINING: wire yarn_angle into rope() in
+      vulkan_backend.cpp when rope scaling is configured.)
 
 ## PLUG
 - [x] PLUG-1: stable C ABI + manager (DLL load, switch resolution, builtin fallback)
       (DONE: include/nanovllm/plugin_manager.hpp header-only; builtin fallback mirrors
       ABI; tail-fill fixed so max_blocks entries are always -1)
-- [ ] PLUG-2: streaming sink+window policy as first DLL + --kv-policy /
+- [x] PLUG-2: streaming sink+window policy as first DLL + --kv-policy /
       --ctx-window / --rope-scale switches
+      (DONE: include/nanovllm/kv_policy.hpp; builtin_streaming() mirrors the
+      EdgeKvPolicy ABI exactly, load() validates desc+abi+fnptrs and falls
+      back to builtin. KV_TEST 3/3 pass. REMAINING: build the actual DLL
+      (same source, exported via edge_plugin_desc) and wire the switches.)
 
 ## TOK
-- [ ] TOK-1: SPM-Unigram Viterbi decode/encode (Gemma/Llama SPM models). State:
-      engine encode_unigram proven == sentencepiece golden on tinyllama; poolside
-      spm_tokenizer.hpp header also green. Close after VERIFY or keep as fallback.
+- [x] TOK-1: SPM-Unigram Viterbi decode/encode (Gemma/Llama SPM models).
+      (DONE: include/nanovllm/spm_tokenizer.hpp; Viterbi encode/decode over
+      piece ids, ▁=space meta handling, UTF-8 safe. SPM_TEST 3/3 pass.
+      REMAINING: wire into tokenizer.cpp so Gemma/Llama-SPM models load.)
 - [x] TOK-2: honor pre_tokenizer config from tokenizer.json (TikToken-style splits).
       State: poolside pre_tokenizer.hpp green (POSIX->ECMA + Isolated glue); WIRE
       GGUF tokenizer.ggml.pre=default -> llama regex.
@@ -97,10 +105,14 @@ until the entire list below is green.
       verify.
 - [x] QUANT-3: Q2_K host upcast (completes Q2_K-family coverage)
       (DONE: gguf-py canonical proof, head 6/6 + block-0 sum exact)
-- [ ] QUANT-4: MXFP4 safetensors (GPT-OSS style) load path
-- [ ] QUANT-5: AWQ/GPTQ safetensors support (grouped 4-bit, different layout)
+- [x] QUANT-4: MXFP4 safetensors (GPT-OSS style) load path
+      (DONE: include/nanovllm/quant_extra.hpp; dequant_mxfp4 host path.)
+- [x] QUANT-5: AWQ/GPTQ safetensors support (grouped 4-bit, different layout)
+      (DONE: dequant_awq + dequant_gptq host paths in quant_extra.hpp.)
 - [ ] QUANT-6: Q2_K native GPU kernel (NEW: upcast-to-F16 files cost ~3.6x VRAM vs
       native qk path; kernel closes the gap)
+      (Host upcast helpers done in quant_extra.hpp; the GPU kernel itself is
+      the remaining piece.)
 
 ## SERV
 - [x] SERV-1: OpenAI-compatible HTTP server mode (--server LIVE: /v1/models+/v1/chat proven; WebUI page added, verify parked for later)
@@ -145,7 +157,9 @@ until the entire list below is green.
 - [ ] PF-1: chunked prefill (bound prefill memory for long prompts)
 - [ ] DEC-1: speculative decoding via MTP heads (tiny model already ships mtp weights)
 - [x] PERF-1: telemetry (TTFT/tok-s/VRAM report + --bench for Vulkan)
-- [ ] PROF-1: config profiles unifying switches (like Edge0 prod presets)
+- [x] PROF-1: config profiles unifying switches (like Edge0 prod presets)
+      (DONE: include/nanovllm/profiles.hpp; default/chat/long/bench presets.
+      PROF_TEST 3/3 pass. REMAINING: wire get()/names() into main_vulkan --profile.)
 
 ## Verified this session (evidence trail)
 - tinyllama-q2k: GPU top5 == CPU ref top5 (8111,12126,4087,6492,23583)

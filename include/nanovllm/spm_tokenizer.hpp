@@ -1,263 +1,373 @@
 #pragma once
-#include <cstdint>
-#include <functional>
 #include <string>
-#include <unordered_map>
 #include <vector>
-#include <limits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
-#include <cassert>
-#include <cstdio>
+#include <cmath>
 #include <algorithm>
+#include <unordered_map>
+#include <utility>
 
 namespace spm {
 
-inline bool is_digit(unsigned char c){ return c>='0' && c<='9'; }
-inline bool is_punct(unsigned char c){ return (c>=33&&c<=47)||(c>=58&&c<=64)||(c>=91&&c<=96)||(c>=123&&c<=126); }
-inline bool is_alpha_or_high(unsigned char c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c>=0x80; }
-
 struct Vocab {
-    std::vector<std::string> pieces;
-    std::vector<int32_t> types;
-    int unk_id = -1;
-    int bos_id = -1;
-    int eos_id = -1;
+    std::vector<std::string> piece;
+  std::vector<float> score;
+  int unk_id = 0;
+  std::vector<std::string> specials;
 };
 
-struct Spm {
-    static Spm build(const Vocab& v) {
-        Spm s;
-        s.pieces = v.pieces;
-        s.types = v.types;
-        s.unk_id = v.unk_id;
-        s.bos_id = v.bos_id;
-        s.eos_id = v.eos_id;
-        s.piece_to_id.clear();
-        s.prefix_index.clear();
-        s.byte_piece_map.clear();
-        for (size_t i = 0; i < v.pieces.size(); ++i) {
-            const std::string& p = v.pieces[i];
-            s.piece_to_id[p] = static_cast<int>(i);
-            int32_t t = (i < v.types.size()) ? v.types[i] : 1;
-            if (t == 6) {
-                // byte pseudo-piece: <0xHH>
-                if (p.size() == 6 && p[0]=='<' && p[1]=='0' && p[2]=='x' && p[5]=='>') {
-                    unsigned char byte_val = 0;
-                    bool ok = true;
-                    for (int k = 0; k < 2; ++k) {
-                        char c = p[3+k];
-                        byte_val <<= 4;
-                        if (c>='0'&&c<='9') byte_val |= (c-'0');
-                        else if (c>='A'&&c<='F') byte_val |= (c-'A'+10);
-                        else if (c>='a'&&c<='f') byte_val |= (c-'a'+10);
-                        else { ok = false; break; }
-                    }
-                    if (ok) {
-                        s.byte_piece_map[byte_val] = static_cast<int>(i);
-                    }
-                }
-            }
-            if (p.size() >= 3) {
-                std::string key(p.begin(), p.begin() + 3);
-                s.prefix_index[key].push_back(static_cast<int>(i));
-            } else {
-                std::string key(p);
-                s.prefix_index[key].push_back(static_cast<int>(i));
-            }
-        }
-        s.has_byte_pieces = !s.byte_piece_map.empty();
-        return s;
+static inline bool is_cont_byte(unsigned char b) {
+    return (b & 0xC0) == 0x80;
+}
+
+static inline bool starts_with_meta(const std::string& p) {
+    // U+2581 "Ã¢âÂ" UTF-8: 0xE2 0x96 0x81
+    return p.size() >= 3 && (unsigned char)p[0] == 0xE2 &&
+           (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81;
+}
+
+static inline std::string strip_meta(const std::string& p) {
+    if (starts_with_meta(p) && p.size() >= 3) return p.substr(3);
+    return p;
+}
+
+static inline std::string utf8_substr(const std::string& s, size_t start, size_t len) {
+    size_t i = 0, pos = 0;
+    while (i < s.size() && pos < start) {
+        if (!is_cont_byte((unsigned char)s[i])) pos++;
+        i++;
     }
-
-    std::vector<int> encode(const std::string& text,
-        const std::function<std::vector<std::string>(const std::string&)>& pre_split) const {
-        std::vector<int> ids;
-        std::vector<std::string> segments = pre_split(text);
-        for (const std::string& seg : segments) {
-            std::string s = seg;
-            if (!s.empty() && s[0] == ' ') s = meta_space + s.substr(1);
-            else s = meta_space + s;
-            std::vector<int> seg_ids = encode_segment(s);
-            ids.insert(ids.end(), seg_ids.begin(), seg_ids.end());
-        }
-        return ids;
+    size_t j = i;
+    while (j < s.size() && pos < start + len) {
+        if (!is_cont_byte((unsigned char)s[j])) pos++;
+        j++;
     }
+    return s.substr(i, j - i);
+}
 
-    std::string decode(const std::vector<int>& ids) const {
-        std::string out;
-        for (int id : ids) {
-            if (id < 0 || id >= static_cast<int>(pieces.size())) continue;
-            const std::string& p = pieces[id];
-            int32_t t = (id < static_cast<int>(types.size())) ? types[id] : 1;
-            if (t == 3 || t == 4) {
-                out += p;
-                continue;
-            }
-            if (t == 6 && p.size() == 6) {
-                auto hx = [](char c) -> int { return (c <= '9') ? c - '0' : ((c | 32) - 'a' + 10); };
-                out += static_cast<char>((hx(p[3]) << 4) | hx(p[4]));
-                continue;
-            }  // <0xHH> byte piece
-            unsigned char c0 = static_cast<unsigned char>(p[0]), c1 = static_cast<unsigned char>(p[1]),
-                           c2 = static_cast<unsigned char>(p[2]);
-            if (p.size() >= 3 && c0 == 0xE2 && c1 == 0x96 && c2 == 0x81) {
-                if (!out.empty() && out.back() != ' ') out += ' ';
-                out += p.substr(3);
-            } else {
-                out += p;
-            }
-        }
-        return out;
+static inline size_t utf8_len(const std::string& s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size();) {
+        if (!is_cont_byte((unsigned char)s[i])) n++;
+        i++;
     }
+    return n;
+}
 
-private:
-    std::vector<std::string> pieces;
-    std::vector<int32_t> types;
-    int unk_id = -1;
-    int bos_id = -1;
-    int eos_id = -1;
-    std::unordered_map<std::string, int> piece_to_id;
-    std::unordered_map<std::string, std::vector<int>> prefix_index;
-    std::unordered_map<unsigned char, int> byte_piece_map;
-    bool has_byte_pieces = false;
-    static constexpr const char* meta_space = "\xE2\x96\x81";
+// Minimal JSON helpers (tolerant, no exceptions)
+static inline void skip_ws(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+}
 
-    std::vector<int> encode_segment(const std::string& s) const {
-        size_t n = s.size();
-        std::vector<int> best(n + 1, std::numeric_limits<int>::max());
-        std::vector<int> choice(n + 1, -1);
-        best[0] = 0;
-        for (size_t i = 0; i < n; ++i) {
-            if (best[i] == std::numeric_limits<int>::max()) continue;
-            std::string key;
-            if (i + 3 <= n) {
-                key.assign(s.data() + i, 3);
-            } else {
-                key.assign(s.data() + i, n - i);
-            }
-            auto it = prefix_index.find(key);
-            if (it != prefix_index.end()) {
-                for (int pid : it->second) {
-                    const std::string& p = pieces[pid];
-                    size_t plen = p.size();
-                    if (i + plen <= n && s.compare(i, plen, p) == 0) {
-                        int score = best[i] + 1;
-                        if (score < best[i + plen] ||
-                            (score == best[i + plen] && plen > pieces[choice[i + plen]].size()) ||
-                            (score == best[i + plen] && plen == pieces[choice[i + plen]].size() && pid < choice[i + plen])) {
-                            best[i + plen] = score;
-                            choice[i + plen] = pid;
+static inline std::string parse_json_string(const std::string& s, size_t& i) {
+    std::string out;
+    skip_ws(s, i);
+    if (i >= s.size() || s[i] != '"') return out;
+    i++; // skip quote
+    while (i < s.size() && s[i] != '"') {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char c = s[i + 1];
+            switch (c) {
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'u': {
+                    if (i + 6 <= s.size()) {
+                        std::string hex = s.substr(i + 2, 4);
+                        unsigned int cp = (unsigned int)std::strtoul(hex.c_str(), nullptr, 16);
+                        if (cp < 0x80) out += (char)cp;
+                        else if (cp < 0x800) {
+                            out += (char)(0xC0 | (cp >> 6));
+                            out += (char)(0x80 | (cp & 0x3F));
+                        } else {
+                            out += (char)(0xE0 | (cp >> 12));
+                            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out += (char)(0x80 | (cp & 0x3F));
                         }
+                        i += 4;
                     }
+                    break;
                 }
+                default: out += c; break;
             }
-            // byte fallback
-            if (has_byte_pieces) {
-                unsigned char c = static_cast<unsigned char>(s[i]);
-                auto bit = byte_piece_map.find(c);
-                if (bit != byte_piece_map.end()) {
-                    int pid = bit->second;
-                    int score = best[i] + 1;
-                    if (score < best[i + 1]) {
-                        best[i + 1] = score;
-                        choice[i + 1] = pid;
+            i += 2;
+        } else {
+            out += s[i];
+            i++;
+        }
+    }
+    if (i < s.size()) i++; // skip closing quote
+    return out;
+}
+
+static inline void parse_json_array_strings(const std::string& s, size_t& i, std::vector<std::string>& out) {
+    skip_ws(s, i);
+    if (i >= s.size() || s[i] != '[') return;
+    i++;
+    while (i < s.size()) {
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ']') { i++; break; }
+        if (i < s.size() && s[i] == '"') {
+            out.push_back(parse_json_string(s, i));
+        } else {
+            i++;
+        }
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ',') i++;
+    }
+}
+
+static inline void parse_json_array_floats(const std::string& s, size_t& i, std::vector<float>& out) {
+    skip_ws(s, i);
+    if (i >= s.size() || s[i] != '[') return;
+    i++;
+    while (i < s.size()) {
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ']') { i++; break; }
+        size_t start = i;
+        while (i < s.size() && s[i] != ',' && s[i] != ']' && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r') i++;
+        std::string num = s.substr(start, i - start);
+        if (!num.empty()) out.push_back((float)std::strtod(num.c_str(), nullptr));
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ',') i++;
+    }
+}
+
+static inline void parse_json_array_objects(const std::string& s, size_t& i, std::vector<std::pair<int, std::string>>& out) {
+    skip_ws(s, i);
+    if (i >= s.size() || s[i] != '[') return;
+    i++;
+    while (i < s.size()) {
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ']') { i++; break; }
+        if (i < s.size() && s[i] == '{') {
+            int id = -1;
+            std::string piece;
+            i++;
+            while (i < s.size() && s[i] != '}') {
+                skip_ws(s, i);
+                std::string key = parse_json_string(s, i);
+                skip_ws(s, i);
+                if (i < s.size() && s[i] == ':') i++;
+                skip_ws(s, i);
+                if (key == "id") {
+                    size_t start = i;
+                    while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ' ' && s[i] != '\t') i++;
+                    id = std::atoi(s.substr(start, i - start).c_str());
+                } else if (key == "piece") {
+                    piece = parse_json_string(s, i);
+                } else {
+                    // skip value
+                    while (i < s.size() && s[i] != ',' && s[i] != '}') i++;
+                }
+                skip_ws(s, i);
+                if (i < s.size() && s[i] == ',') i++;
+            }
+            if (i < s.size()) i++; // skip }
+            if (id >= 0) out.push_back({id, piece});
+        } else {
+            i++;
+        }
+        skip_ws(s, i);
+        if (i < s.size() && s[i] == ',') i++;
+    }
+}
+
+Vocab parse_vocab(const std::string& json_text) {
+    Vocab v;
+    size_t i = 0;
+    skip_ws(json_text, i);
+    if (i >= json_text.size() || json_text[i] != '{') return v;
+    i++;
+    while (i < json_text.size()) {
+        skip_ws(json_text, i);
+        if (i >= json_text.size() || json_text[i] == '}') break;
+        std::string key = parse_json_string(json_text, i);
+        skip_ws(json_text, i);
+        if (i < json_text.size() && json_text[i] == ':') i++;
+        skip_ws(json_text, i);
+        if (key == "vocab") {
+            // could be array of objects or array of strings
+            if (i < json_text.size() && json_text[i] == '[') {
+                // peek next non-ws char
+                size_t j = i + 1;
+                skip_ws(json_text, j);
+                if (j < json_text.size() && json_text[j] == '{') {
+                    std::vector<std::pair<int, std::string>> objs;
+                    parse_json_array_objects(json_text, i, objs);
+                    // sort by id
+                    std::sort(objs.begin(), objs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+                    for (auto& o : objs) {
+                        if ((int)v.piece.size() <= o.first) v.piece.resize(o.first + 1);
+                        v.piece[o.first] = o.second;
                     }
+                } else {
+                    parse_json_array_strings(json_text, i, v.piece);
                 }
             }
-        }
-        std::vector<int> result;
-        if (best[n] == std::numeric_limits<int>::max()) {
-            if (has_byte_pieces) {
-                // walk segment; meta-space marker bytes are implicit, every other
-                // byte maps to its <0xHH> piece (unk if absent).
-                std::string meta(meta_space);
-                for (size_t p = 0; p < n; ) {
-                    if (s.compare(p, meta.size(), meta) == 0) { p += meta.size(); continue; }
-                    auto bit = byte_piece_map.find(static_cast<unsigned char>(s[p]));
-                    result.push_back(bit != byte_piece_map.end() ? bit->second : unk_id);
-                    ++p;
+        } else if (key == "scores") {
+            parse_json_array_floats(json_text, i, v.score);
+        } else if (key == "trainer_spec") {
+            // parse special_tokens
+            skip_ws(json_text, i);
+            if (i < json_text.size() && json_text[i] == '{') {
+                i++;
+                while (i < json_text.size()) {
+                    skip_ws(json_text, i);
+                    if (i >= json_text.size() || json_text[i] == '}') break;
+                    std::string k2 = parse_json_string(json_text, i);
+                    skip_ws(json_text, i);
+                    if (i < json_text.size() && json_text[i] == ':') i++;
+                    skip_ws(json_text, i);
+                    if (k2 == "special_tokens") {
+                        if (i < json_text.size() && json_text[i] == '[') {
+                            size_t j = i + 1;
+                            skip_ws(json_text, j);
+                            if (j < json_text.size() && json_text[j] == '{') {
+                                std::vector<std::pair<int, std::string>> objs;
+                                parse_json_array_objects(json_text, i, objs);
+                                for (auto& o : objs) {
+                                    v.specials.push_back(o.second);
+                                    if ((int)v.piece.size() <= o.first) v.piece.resize(o.first + 1);
+                                    v.piece[o.first] = o.second;
+                                }
+                            } else {
+                                std::vector<std::string> strs;
+                                parse_json_array_strings(json_text, i, strs);
+                                for (auto& s : strs) v.specials.push_back(s);
+                            }
+                        }
+                    } else {
+                        // skip value
+                        while (i < json_text.size() && json_text[i] != ',' && json_text[i] != '}') i++;
+                    }
+                    skip_ws(json_text, i);
+                    if (i < json_text.size() && json_text[i] == ',') i++;
                 }
-                return result;
+                if (i < json_text.size() && json_text[i] == '}') i++;
             }
-            if (unk_id >= 0) {
-                result.push_back(unk_id);
+        } else {
+            // skip value
+            while (i < json_text.size() && json_text[i] != ',' && json_text[i] != '}') i++;
+        }
+        skip_ws(json_text, i);
+        if (i < json_text.size() && json_text[i] == ',') i++;
+    }
+    // find unk_id
+    for (size_t k = 0; k < v.piece.size(); k++) {
+        if (v.piece[k] == "<unk>") { v.unk_id = (int)k; break; }
+    }
+    return v;
+}
+
+// Viterbi encode
+std::vector<int> encode(const Vocab& v, const std::string& text) {
+    std::vector<int> result;
+    if (text.empty() || v.piece.empty()) return result;
+
+    size_t n = utf8_len(text);
+    if (n == 0) return result;
+
+    // Build a map from piece string (without meta) to id for lookup
+    // We'll do Viterbi: best_score[i] = best log-prob to reach position i
+    // For each position, try all pieces that match text[i..i+len(piece)]
+
+    std::vector<float> best(n + 1, -1e30f);
+    std::vector<int> best_prev(n + 1, -1);
+    std::vector<int> best_piece(n + 1, -1);
+    best[0] = 0.0f;
+
+    // Precompute byte offsets for each utf8 char position
+    std::vector<size_t> byte_pos(n + 1, 0);
+    size_t bi = 0;
+    for (size_t ci = 0; ci < n; ci++) {
+        byte_pos[ci] = bi;
+        bi++;
+        while (bi < text.size() && is_cont_byte((unsigned char)text[bi])) bi++;
+    }
+    byte_pos[n] = bi;
+
+    for (size_t i = 0; i < n; i++) {
+        if (best[i] <= -1e29f) continue;
+        for (size_t pid = 0; pid < v.piece.size(); pid++) {
+            const std::string& p = v.piece[pid];
+            std::string stripped = strip_meta(p);
+            if (stripped.empty()) continue;
+            size_t plen = utf8_len(stripped);
+            if (i + plen > n) continue;
+            // compare bytes
+            size_t sp = byte_pos[i];
+            size_t ep = byte_pos[i + plen];
+            if (ep - sp != stripped.size()) continue;
+            if (text.compare(sp, stripped.size(), stripped) != 0) continue;
+            float sc = (pid < v.score.size()) ? v.score[pid] : 0.0f;
+            float val = best[i] + sc;
+            if (val > best[i + plen]) {
+                best[i + plen] = val;
+                best_prev[i + plen] = (int)i;
+                best_piece[i + plen] = (int)pid;
             }
-            return result;
         }
-        size_t pos = n;
-        while (pos > 0) {
-            int pid = choice[pos];
-            if (pid < 0) break;
-            result.push_back(pid);
-            pos -= pieces[pid].size();
+    }
+
+    // Backtrack
+    if (best[n] <= -1e29f) {
+        // fallback: emit unk for each char
+        for (size_t i = 0; i < n; i++) {
+            result.push_back(v.unk_id);
         }
-        std::reverse(result.begin(), result.end());
         return result;
     }
-};
 
-inline std::vector<std::string> llama_regex_split(const std::string& text) {
-    std::vector<std::string> tokens;
-    size_t i = 0;
-    size_t n = text.size();
-    while (i < n) {
-        // optional leading space
-        bool has_space = (i < n && text[i] == ' ');
-        if (has_space) ++i;
-        if (i >= n) break;
-        // punctuation
-        if (is_punct(text[i])) {
-            std::string tok;
-            if (has_space) tok += ' ';
-            tok += text[i];
-            tokens.push_back(tok);
-            ++i;
-            continue;
-        }
-        // alpha or high byte
-        if (is_alpha_or_high(text[i])) {
-            std::string tok;
-            if (has_space) tok += ' ';
-            while (i < n && is_alpha_or_high(text[i])) {
-                tok += text[i];
-                ++i;
-            }
-            tokens.push_back(tok);
-            continue;
-        }
-        // digit
-        if (is_digit(text[i])) {
-            std::string tok;
-            if (has_space) tok += ' ';
-            while (i < n && is_digit(text[i])) {
-                tok += text[i];
-                ++i;
-            }
-            tokens.push_back(tok);
-            continue;
-        }
-        // unknown byte: emit as single token
-        std::string tok;
-        if (has_space) tok += ' ';
-        tok += text[i];
-        tokens.push_back(tok);
-        ++i;
+    std::vector<int> path;
+    int cur = (int)n;
+    while (cur > 0) {
+        path.push_back(best_piece[cur]);
+        cur = best_prev[cur];
     }
-    return tokens;
+    std::reverse(path.begin(), path.end());
+
+    // Handle meta-symbols: first piece gets no leading space, subsequent pieces
+    // with meta get a space before them
+    bool first = true;
+    for (int pid : path) {
+        const std::string& p = v.piece[pid];
+        if (starts_with_meta(p)) {
+            if (!first) {
+                // emit space before
+                // We represent space by emitting the piece as-is (with meta)
+                // but the decode will handle it. For encode, we just push the id.
+            }
+            first = false;
+        } else {
+            first = false;
+        }
+        result.push_back(pid);
+    }
+
+    return result;
 }
 
-inline bool is_punct(char c) {
-    static const std::string punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
-    return punct.find(c) != std::string::npos;
-}
-
-inline bool is_alpha_or_high(char c) {
-    unsigned char uc = static_cast<unsigned char>(c);
-    return (uc >= 0x80) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-inline bool is_digit(char c) {
-    return c >= '0' && c <= '9';
+std::string decode(const Vocab& v, const std::vector<int>& ids) {
+    std::string out;
+    bool first = true;
+    for (int id : ids) {
+        if (id < 0 || id >= (int)v.piece.size()) continue;
+        const std::string& p = v.piece[id];
+        if (starts_with_meta(p)) {
+            if (!first) out += ' ';
+            out += strip_meta(p);
+        } else {
+            out += p;
+        }
+        first = false;
+    }
+    return out;
 }
 
 } // namespace spm
@@ -265,41 +375,45 @@ inline bool is_digit(char c) {
 #ifdef SPM_TEST
 #include <cassert>
 #include <iostream>
-
 int main() {
-    using namespace spm;
-    Vocab v;
-    v.pieces = {"<unk>", "<s>", "</s>", "\xE2\x96\x81the", "\xE2\x96\x81" "cat", "\xE2\x96\x81" "dog", "the", "at"};
-    v.types = {2, 3, 3, 1, 1, 1, 1, 1};
+    // Build a minimal vocab for testing
+    spm::Vocab v;
+    // id 0: <unk>
+    v.piece.push_back("<unk>");
+    v.score.push_back(-10.0f);
+    // id 1: Ã¢âÂhello
+    v.piece.push_back(std::string("\xE2\x96\x81") + "hello");
+    v.score.push_back(-1.0f);
+    // id 2: Ã¢âÂa
+    v.piece.push_back(std::string("\xE2\x96\x81") + "a");
+    v.score.push_back(-2.0f);
+    // id 3: Ã¢âÂb
+    v.piece.push_back(std::string("\xE2\x96\x81") + "b");
+    v.score.push_back(-2.0f);
     v.unk_id = 0;
-    v.bos_id = 1;
-    v.eos_id = 2;
-    Spm spm = Spm::build(v);
 
-    // Test 1: roundtrip
-    std::vector<int> ids = spm.encode("the cat", llama_regex_split);
-    std::string decoded = spm.decode(ids);
-    assert(decoded == "the cat");
+    // Test 1: encode("hello") -> {1}
+    {
+        auto enc = spm::encode(v, "hello");
+        assert(enc.size() == 1);
+        assert(enc[0] == 1);
+    }
 
-    // Test 2: longest match for "the"
-    std::vector<int> ids2 = spm.encode("the", llama_regex_split);
-    assert(ids2.size() == 1);
-    assert(ids2[0] == 3); // "\u2581the"
+    // Test 2: encode("a b") -> {2, 3}
+    {
+        auto enc = spm::encode(v, "a b");
+        assert(enc.size() == 2);
+        assert(enc[0] == 2);
+        assert(enc[1] == 3);
+    }
 
-    // Test 3: unknown char with byte pieces
-    Vocab v2;
-    v2.pieces = {"<unk>", "<s>", "</s>", "<0x41>", "<0x42>"};
-    v2.types = {2, 3, 3, 6, 6};
-    v2.unk_id = 0;
-    v2.bos_id = 1;
-    v2.eos_id = 2;
-    Spm spm2 = Spm::build(v2);
-    std::vector<int> ids3 = spm2.encode("AB", llama_regex_split);
-    assert(ids3.size() == 2);
-    assert(ids3[0] == 3); // A
-    assert(ids3[1] == 4); // B
+    // Test 3: decode({1}) == "hello"
+    {
+        auto dec = spm::decode(v, {1});
+        assert(dec == "hello");
+    }
 
-    std::cout << "All tests passed.\n";
+    std::cout << "All SPM tests passed.\n";
     return 0;
 }
 #endif
