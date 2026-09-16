@@ -36,6 +36,7 @@ until the entire list below is green.
 - [x] ATTN-1: sliding-window bounds in paged_attention (Gemma SWA + bounded-KV
       decode). State: shader sw_start + backend PC wired; vulkan_model.cpp passes
       0,0 -- needs config fields + GGUF mapping.
+- [ ] ATTN-4: mRoPE (qwen3-family rope.dimension_sections text path; Qwen3.8 blocked on SSM+mRoPE, SSM guard landed)
 - [x] ATTN-2: logit softcap (tanh) in attention + final logits (Gemma-2/3).
       State: attn softcap in shader; final-logits cap missing.
 - [ ] ATTN-3: K/V SLM tiling in paged_attention (prefill throughput, fewer V re-reads)
@@ -67,7 +68,7 @@ until the entire list below is green.
 ## HF
 - [x] HF-1: read generation_config.json (per-model EOS/sampling defaults)
       (DONE: config.hpp gen_* flags; CLI wins in main_vulkan)
-- [ ] HF-2: architectures-registry for loader dispatch (replace scattered probes)
+- [x] HF-2: architectures-registry for loader dispatch (replace scattered probes)
 
 ## QUANT
 - [x] QUANT-1: Q4_0/Q4_1 host upcast (Phi-3-mini-q4 + all Q4_0 files fail today).
@@ -83,7 +84,7 @@ until the entire list below is green.
       native qk path; kernel closes the gap)
 
 ## SERV
-- [ ] SERV-1: OpenAI-compatible HTTP server mode (--server stub exists; poolside
+- [ ] SERV-1: OpenAI-compatible HTTP server mode (--server LIVE: /v1/models+/v1/chat proven; WebUI page added, verify parked for later; poolside
       http_server.hpp draft written, unwired)
 - [ ] SERV-2: embeddings endpoint + concurrent request batching
 

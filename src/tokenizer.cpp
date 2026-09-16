@@ -1,5 +1,6 @@
 #include "nanovllm/tokenizer.hpp"
 #include "nanovllm/chat_template.hpp"
+#include "nanovllm/config.hpp"
 #include "nanovllm/pre_tokenizer.hpp"
 
 // TOK-2: apply an HF Split/Regex stage via the tested ptok implementation
@@ -323,7 +324,7 @@ bool Tokenizer::load_from_gguf(const std::string& model_dir) {
   // TOK-1: SPM ("llama") and explicit "unigram" GGUFs carry scores but no
   // merges (verified on C:\models: Phi-3-mini, Tiny-LLM, tinyllama*). BPE
   // models (gpt2/gemma4) always have merges, keeping the BPE path identical.
-  unigram_ = merge_rank_.empty() && (tok_model == "unigram" || tok_model == "llama" || has_scores);
+  unigram_ = merge_rank_.empty() && (ArchRules::unigram_by_scores(tok_model) || has_scores);
   note_pretok_fallback("no pre_tokenizer config (GGUF metadata has none)");
   // last-resort specials by name (some Qwen GGUFs mark everything NORMAL)
   for (const char* s : {"<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|im_sep|>"}) {
@@ -338,7 +339,7 @@ bool Tokenizer::load_from_gguf(const std::string& model_dir) {
   if (const GGUFMetaValue* ab = g.meta("tokenizer.ggml.add_bos_token"))
     add_bos_ = ab->b;
   else
-    add_bos_ = (tok_model == "llama");  // llama.cpp default when key absent
+    add_bos_ = ArchRules::default_add_bos(tok_model);  // llama.cpp default when key absent
   if (eos_id_ < 0) {
     auto it = special_id_.find("<|endoftext|>");
     if (it != special_id_.end()) eos_id_ = it->second;

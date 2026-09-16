@@ -17,6 +17,19 @@ struct HFConfig;
 // Only the prefill/attention/rope/ffn fields that nano-vllm needs are read.
 static void fill_from_gguf(HFConfig& c, const GGUFLoader& g);
 
+// HF-2: centralized architecture rules (replaces scattered string probes).
+struct ArchRules {
+  static bool ties_embeddings(const std::string& model_type) {
+    return (model_type != "qwen2" && model_type != "llama");
+  }
+  static bool default_add_bos(const std::string& tok_model) {
+    return (tok_model == "llama");
+  }
+  static bool unigram_by_scores(const std::string& tok_model) {
+    return (tok_model == "unigram" || tok_model == "llama");
+  }
+};
+
 struct HFConfig {
   int hidden_size = 0;
   int intermediate_size = 0;
@@ -61,7 +74,7 @@ struct HFConfig {
     }
     if (cfg->contains("model_type")) c.model_type = cfg->at("model_type").as_string();
     else if (j.contains("model_type")) c.model_type = j.at("model_type").as_string();
-    c.tie_word_embeddings = (c.model_type != "qwen2" && c.model_type != "llama");
+    c.tie_word_embeddings = ArchRules::ties_embeddings(c.model_type);
     c.hidden_size = cfg->at("hidden_size").as_int();
     c.intermediate_size = cfg->at("intermediate_size").as_int();
     c.num_attention_heads = cfg->at("num_attention_heads").as_int();

@@ -1,10 +1,12 @@
 #define NOMINMAX
+#include "nanovllm/http_server.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -122,11 +124,6 @@ int main(int argc, char** argv) {
     }
     if (model_dir.empty()) { usage(argv[0]); return 1; }
 
-    if (server_mode) {
-      std::fprintf(stderr, "Vulkan server mode not yet implemented. Use CLI mode.\n");
-      return 1;
-    }
-
     Config config;
     config.model = model_dir;
     config.max_model_len = max_model_len;
@@ -162,6 +159,68 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int> ids = tok.encode_text(prompt);
+    if (server_mode) {
+      // SERV-1: OpenAI-compatible loop. One request at a time (mutex guards
+      // the shared KV cache; concurrent batching is SERV-2).
+      std::mutex srv_mu;
+      minihttp::Handler handler = [&](const minihttp::ChatRequest& req) -> std::string {
+        std::lock_guard<std::mutex> lk(srv_mu);
+        std::string text = req.last_user;
+        if (tok.has_chat_template()) text = tok.apply_chat_template(text);
+        std::vector<int> rids = tok.encode_text(text);
+        if (rids.empty()) return "";
+        double temp = req.temperature > 0 ? req.temperature : temperature;
+        int mt = req.max_tokens > 0 ? req.max_tokens : max_tokens;
+        int rbsize = config.kvcache_block_size;
+        int rmax_blocks = 64;
+        std::vector<int32_t> rbt(rmax_blocks, -1);
+        for (size_t i = 0; i < rids.size(); ++i) rbt[i / rbsize] = (int32_t)(i / rbsize);
+        std::mt19937 rrng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+        VKContext ctx;
+        int n = (int)rids.size();
+        ctx.input_ids.assign(rids.begin(), rids.end());
+        ctx.positions.resize(n);
+        for (int i = 0; i < n; ++i) ctx.positions[i] = i;
+        ctx.slot_mapping.resize(n);
+        for (int i = 0; i < n; ++i) ctx.slot_mapping[i] = (int32_t)i;
+        ctx.block_tables = rbt;
+        ctx.query_seq = std::vector<int32_t>(n, 0);
+        ctx.query_key_len.resize(n);
+        for (int i = 0; i < n; ++i) ctx.query_key_len[i] = i + 1;
+        ctx.last_indices = {n - 1};
+        ctx.max_blocks = rmax_blocks;
+        auto lg = model.forward_logits(ctx);
+        std::vector<int> rout;
+        int pos = n;
+        int nxt = sample_row(&lg[0], config.hf.vocab_size, temp, top_p, rrng,
+                             rout.data(), rout.size(), rep_penalty, rep_window);
+        rout.push_back(nxt);
+        std::string text_out = tok.decode_tokens({nxt});
+        while ((int)rout.size() < mt) {
+          VKContext d;
+          d.input_ids = {rout.back()};
+          d.positions = {pos};
+          std::vector<int32_t> bt2(rmax_blocks, -1);
+          for (int i = 0; i <= pos; ++i) bt2[i / rbsize] = (int32_t)(i / rbsize);
+          d.block_tables = bt2;
+          d.slot_mapping = {pos};
+          d.query_seq = {0};
+          d.query_key_len = {pos + 1};
+          d.last_indices = {0};
+          d.max_blocks = rmax_blocks;
+          auto lg2 = model.forward_logits(d);
+          int t = sample_row(&lg2[0], config.hf.vocab_size, temp, top_p, rrng,
+                             rout.data(), rout.size(), rep_penalty, rep_window);
+          if (t == config.eos) break;
+          text_out += tok.decode_tokens({t});
+          rout.push_back(t);
+          ++pos;
+        }
+        return text_out;
+      };
+      minihttp::serve(server_port, model_dir, handler);
+      return 0;
+    }
     if (use_chat) {
       if (tok.has_chat_template()) {
         ids = tok.encode_text(tok.apply_chat_template(prompt, system_prompt));
