@@ -24,6 +24,8 @@
 - [x] REAS-1: reason.hpp into --repl post-processing (postprocess_reply strips [thinking])
 - [x] GEN-1: gen.hpp into --repl constrained sampling (--json-shape)
 - [x] PROF-1 wiring: get()/names() into main_vulkan --profile
+- [x] CTX-1 --rope-scale: CLI override for rope_factor (CLI wins over rope_scaling{})
+      (Verified: [T] rope-scale override factor=1.500 + [T] rope L0 factor=1.500.)
 
 ## PENDING — engine work (13 items, not started)
 - [ ] SERV-2: embeddings endpoint + concurrent request batching (http_server.hpp + main_vulkan)
@@ -38,18 +40,23 @@
 - [ ] 8GB-MoE (2/3): GGUF MoE naming (blk.N.ffn_*_exps) + lift gguf-only throw
 - [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place, bit-golden vs gguf-py
 - [ ] SAMP-1: verify sample_row's windowed rep_penalty vs spec
-- [ ] PROF-1 wiring: get()/names() into main_vulkan --profile
 
-## PENDING — headers built, wiring into the binary needed (9 items)
-- [ ] QUANT-4/5 wiring: dequant_mxfp4/awq/gptq into vulkan_model.cpp loader path
-- [ ] RAG-1 wiring: bm25.hpp into --repl/--server retrieval
-- [ ] MCP-1 wiring: mcp_client.hpp as a --repl tool source
-- [ ] ADAPT-1 wiring: lora.hpp into the weight loading path
-- [ ] DEC-2 wiring: drafter.hpp into the decode loop
-- [ ] CACHE-1 wiring: cache.hpp into the KV block manager
-- [ ] REAS-1 wiring: reason.hpp into --repl post-processing
-- [ ] GEN-1 wiring: gen.hpp into --repl constrained sampling
-- [ ] PLUG-2 wiring: build the streaming DLL (kv_policy.hpp source, edge_plugin_desc) + --kv-policy/--ctx-window/--rope-scale
+## PENDING — headers built, wiring into the binary needed
+(already-wired items moved to DONE above: RAG-1, MCP-1, DEC-2, REAS-1, GEN-1,
+PROF-1, CTX-1 --rope-scale. ADAPT-1/lora dropped per user: YAGNI, no adapter.)
+- [ ] QUANT-4/5 wiring: dequant_mxfp4/awq/gptq into the loader path.
+      SKIPPED for now: safetensors.cpp throws on unknown dtypes and AWQ/GPTQ
+      need group-size metadata the loader doesn't parse; no test model on hand.
+      Add when an AWQ/GPTQ/MXFP4 model needs loading.
+- [ ] CACHE-1 wiring: cache.hpp RadixCache into the KV block manager.
+      SKIPPED for now: --repl already retains the full shared KV across turns,
+      so a radix prefix cache adds zero in single-session; real value is
+      cross-request in --server (which resets KV per request today).
+      Add with SERV-2 batching.
+- [ ] PLUG-2 wiring: build the streaming DLL + --kv-policy/--ctx-window switches.
+      SKIPPED for now: no DLL exists (load() always falls back to builtin) and
+      a windowed key_len without shader sw_start support (ATTN-1 gap:
+      vulkan_model passes 0,0) would silently mis-attend. Wire with ATTN-1.
 
 
 Every backlog item keeps its own line with its own status. Debug probes

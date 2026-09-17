@@ -34,7 +34,7 @@ static void usage(const char* prog) {
   std::fprintf(stderr, "Usage: %s <model_dir> [prompt] [--max-tokens N] [--max-model-len N]\n", prog);
   std::fprintf(stderr, "       [--chat] [--repl] [--temperature T] [--top-p P]\n");
   std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W] [--system S]\n");
-  std::fprintf(stderr, "       [--bench N] [--vram]\n");
+  std::fprintf(stderr, "       [--bench N] [--vram] [--rope-scale F]\n");
   std::fprintf(stderr, "       <model_dir> --server [host] [port]\n");
   std::fprintf(stderr, "  Sampling defaults come from generation_config.json when present;\n");
   std::fprintf(stderr, "  explicit flags always win. --rep-penalty divides the logits of ids\n");
@@ -310,6 +310,8 @@ int main(int argc, char** argv) {
     std::string json_shape;          // GEN-1: constrain output to a JSON shape
     int draft_n = 0;                 // DEC-2: n-gram order (0 = off)
     int draft_k = 8;                 // DEC-2: draft length per step
+    double rope_scale = 1.0;         // CTX-1: CLI override for rope_factor (0 = use config file)
+    bool ropescale_set = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -335,6 +337,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
       else if (a == "--rag-chars" && i + 1 < argc) rag_max_chars = (size_t)std::atoi(argv[++i]);
       else if (a == "--draft-n" && i + 1 < argc) draft_n = std::atoi(argv[++i]);
       else if (a == "--draft-k" && i + 1 < argc) draft_k = std::atoi(argv[++i]);
+      else if (a == "--rope-scale" && i + 1 < argc) { rope_scale = std::atof(argv[++i]); ropescale_set = true; }
       else if (a == "--server") server_mode = true;
       else if (server_mode && server_host == "127.0.0.1" && argv[i][0] != '-') {
         if (strchr(argv[i], '.')) server_host = argv[i];
@@ -350,6 +353,12 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
     config.model = model_dir;
     config.max_model_len = max_model_len;
     config.load_hf_config();
+    // CTX-1: --rope-scale overrides rope_scaling{} from the config file.
+    if (ropescale_set) {
+      config.hf.rope_factor = rope_scale;
+      if (getenv("NANO_DEBUG"))
+        std::fprintf(stderr, "[T] rope-scale override factor=%.3f\n", rope_scale);
+    }
     // PROF-1: --profile chat|long|bench|default sets generation + KV-cache
     // defaults. CLI flags already set on those fields win over the profile.
     if (!profile_name.empty()) {
