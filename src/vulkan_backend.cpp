@@ -387,7 +387,7 @@ void VulkanBackend::dispatch_bound(VkPipeline p,
     push_fn_(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout_, 0, (uint32_t)nbufs, writes);
     if (pc && pc_size) vkCmdPushConstants(cmd_, pipe_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size, pc);
     vkCmdDispatch(cmd_, gx, gy, gz);
-    storage_barrier();
+    if (!std::getenv("NANO_NO_BARRIER")) storage_barrier();
 }
 
 void VulkanBackend::begin_if_needed() {
@@ -437,8 +437,17 @@ void VulkanBackend::submit_wait() {
     si.pWaitSemaphores = waits.data();
     si.pWaitDstStageMask = stages.data();
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd_;
+    auto t0 = std::chrono::steady_clock::now();
     VKC(vkQueueSubmit(q_, 1, &si, fence_));
+    auto t1 = std::chrono::steady_clock::now();
     VKC(vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX));
+    auto t2 = std::chrono::steady_clock::now();
+    if (std::getenv("NANO_TIME")) {
+        static long long n = 0;
+        double sub = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double fen = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        std::fprintf(stderr, "[T] submit #%lld queue=%.3fms fence=%.3fms\n", ++n, sub, fen);
+    }
     VKC(vkResetFences(dev_, 1, &fence_));
     VKC(vkResetCommandBuffer(cmd_, 0));
     xfer_drain();

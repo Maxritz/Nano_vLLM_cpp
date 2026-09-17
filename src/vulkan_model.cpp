@@ -856,8 +856,18 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
     VMatrix& lm = tie_lm_head_ ? embed_ : lm_head_;
     dev_->matmul(selected_dev, lm, out_rows, hf.vocab_size, hidden, logits_dev);
     std::vector<float> out((size_t)out_rows * hf.vocab_size);
+    auto q0 = std::chrono::steady_clock::now();
     dev_->submit_wait();
+    auto q1 = std::chrono::steady_clock::now();
     logits_dev.download(out.data(), (VkDeviceSize)out.size() * sizeof(float));
+    auto q2 = std::chrono::steady_clock::now();
+    if (std::getenv("NANO_TIME")) {
+        static long long n = 0;
+        double rec = 0; // record-side measured at submit_wait already
+        double dl = std::chrono::duration<double, std::milli>(q2 - q1).count();
+        std::fprintf(stderr, "[T] fwd #%lld rows=%d download=%.3fms\n", ++n, rows, dl);
+        (void)rec; (void)q0;
+    }
     // ATTN-2: Gemma final-logit softcap (host-side; exact, negligible cost).
     if (hf.final_logit_softcapping > 0) {
         float c = (float)hf.final_logit_softcapping;
