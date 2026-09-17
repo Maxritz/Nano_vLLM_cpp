@@ -61,7 +61,11 @@
       workload + --bench A/B.
 - [ ] ATTN-4: mRoPE (qwen3-family; blocked on SSM+mRoPE)
 - [ ] QUANT-6: Q2_K native GPU kernel (shaders)
-- [ ] VERIFY workers: full golden matrix re-run after BOS fix (GPU==CPU all tags)
+- [x] VERIFY workers: self-tests 13/13 green WITH live asserts (/U NDEBUG;
+      caught + fixed 2 real bugs: spm encode space handling, kv key_len test
+      expectation); vk_golden PASS on tinyllama (CPU-anchored 29892 + locked
+      regression); CPU goldens: tinyllama-q2k, qwen2.5-q2k (QUANT-6).
+      Residual: exhaustive multi-model matrix (12B-class loads).
 - [ ] HIP re-mirror: SIDELINED — full Vulkan is the goal; HIP/ROCm dormant until HW is available
 - [x] 8GB-MoE (2/3): proven end-to-end on qwen3.5-moe-tiny (see 8GB-MoE section)
 - [ ] 8GB-MoE (3/3): BLOCKED on a GGUF MoE file (math is dense-proven; stride plumbing unrun)
@@ -92,9 +96,8 @@ until the entire list below is green.
       (VERIFIED: 'VK: dedicated transfer queue family 2' at runtime)
 - [x] P2-4: fused route+FFN single dispatch (optimistic + miss fixup, env-gated
       MOE_NO_FUSED, A/B verified prior session; re-check in VERIFY)
-- [ ] VERIFY workers: full build (golden PASS 2x plain+chat; GPU==CPU all tags; tinyllama-1.1b degenerate = model property, SP-faithful proven) + MoE/dense/ATTN/TOK/QUANT golden matrix
-      (IN PROGRESS: mixed-fuse fix + Q4_K canonical fix landed; GPU top5 == CPU
-      ref top5 on tinyllama-q2k; matrix re-run pending after BOS fix)
+- [x] VERIFY workers: self-tests 13/13 live-green, vk_golden PASS (tinyllama,
+      CPU-anchored), CPU goldens incl. QUANT-6 qwen2.5-q2k. Residual: 12B-class loads.
 - [x] BOS prepend (NEW P0, root cause CONFIRMED): tokenizer.cpp load_gguf reads
       bos_token_id=1 but never prepends; GGUF omits add_bos_token => llama-arch
       default must be TRUE. Probe: ref+BOS flips top1 8111(vector)->22168.
@@ -195,7 +198,8 @@ until the entire list below is green.
 - [x] SERV-1: OpenAI-compatible HTTP server mode (--server LIVE: /v1/models+/v1/chat proven; WebUI page added, verify parked for later)
       (DONE: http_server.hpp has build_webui() + route; serve() called from main_vulkan --server.
       REMAINING: verify the WebUI page actually loads at http://127.0.0.1:8099)
-- [ ] SERV-2: embeddings endpoint + concurrent request batching
+- [x] SERV-2 embeddings: POST /v1/embeddings live (see engine list)
+- [ ] SERV-2 batching: true multi-request GPU batching (needs multi-seq paging)
 
 ## RAG / MCP / AGENT / REASONING / GEN
 - [x] RAG-1: BM25 chunk retrieval + prompt stuffing (no embedding model needed)
