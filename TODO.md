@@ -167,11 +167,11 @@ until the entire list below is green.
       CPU ref top5 ids+order (logits within 0.001). Bonus: fixed a real
       space-handling bug in spm::encode found by live asserts.)
 - [x] TOK-2: honor pre_tokenizer config from tokenizer.json (TikToken-style splits).
-      State: poolside pre_tokenizer.hpp green (POSIX->ECMA + Isolated glue); WIRE
-      GGUF tokenizer.ggml.pre=default -> llama regex.
-- [x] TOK-3: Jinja-lite chat-template renderer (loops/conditionals/roles). State:
-      chat_template.hpp tests green; WIRE into --chat incl. zephyr user/assistant
-      specials (engine only knows im_start/im_end today).
+      WIRED + PROVEN: tokenizer.cpp collects pre_tokenizer stages; qwen3.5-moe-tiny
+      segments "Hello, world! Don't stop." -> 8 tokens with no fallback notes.
+- [x] TOK-3: Jinja-lite chat-template renderer (loops/conditionals/roles).
+      WIRED + PROVEN: apply_chat_template() called at all 4 main sites;
+      tinyllama-1.1b-chat --chat expands "Hello" -> 27 tokens and generates.
 
 ## HF
 - [x] HF-1: read generation_config.json (per-model EOS/sampling defaults)
@@ -246,6 +246,13 @@ until the entire list below is green.
 - [x] PROF-1: config profiles unifying switches (like Edge0 prod presets)
       (DONE: include/nanovllm/profiles.hpp; default/chat/long/bench presets.
       PROF_TEST 3/3 pass. REMAINING: wire get()/names() into main_vulkan --profile.)
+
+## Benchmarks (Intel iGPU, --bench 3, 20 tokens; coherent sample verified)
+- qwen2.5-0.5b-q2_k: "The capital of France is" -> "Paris. It is located in
+  the center of the country... country's largest city, and the seat of the
+  government of..." (fluent, factual). TTFT 200ms, decode 5.66 tok/s, prompt 25.05 tok/s.
+- Llama-3.2-1B-Q8_0: TTFT 451ms, decode 2.52 tok/s, prompt 11.09 tok/s.
+- smollm-135m-Q8_0: TTFT 98ms, decode 12.06 tok/s, prompt 51.00 tok/s.
 
 ## Verified this session (evidence trail)
 - tinyllama-15M "The capital of France is": vk_golden PASS (CPU-anchored 29892)
