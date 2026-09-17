@@ -141,7 +141,17 @@ int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
     void moe_route_ffn(VBuf& x, VBuf& logits, VBuf& idx, VBuf& score, VBuf& gu, VBuf& dn,
                        VBuf& slot_of, VBuf& out, int r0, int rows, int H, int I, int K, int E,
                        bool bf16, bool norm);
-    void add_buf(VBuf& a, VBuf& b, int n);
+   void add_buf(VBuf& a, VBuf& b, int n);
+
+  // Raw dispatch for tools/probes (bw_probe): bind buffers by name and push
+  // constants, submit with submit_wait().
+  struct BufBind { uint32_t binding; VkBuffer buffer; VkDeviceSize offset = 0; VkDeviceSize range = 0; };
+  void dispatch(const char* name, const void* pc, size_t pc_size,
+                const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
+  // Same, but skips the trailing storage barrier. Only for runs of independent
+  // dispatches (disjoint outputs); the last one must barrier (or use dispatch).
+  void dispatch_nb(const char* name, const void* pc, size_t pc_size,
+                   const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
 
   template <class T>
   VBuf make(const std::vector<T>& host, VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
@@ -159,7 +169,6 @@ int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
                  VkDevice dev, VkRT* rt, uint32_t qfi, bool is_amd, bool is_rdna4);
   void ensure_pipeline(const char* spv_name);
   VkPipeline get_pipe(const char* name);
-  struct BufBind { uint32_t binding; VkBuffer buffer; VkDeviceSize offset = 0; VkDeviceSize range = 0; };
   // Specialization-constant pipeline variant (e.g. moe_ffn SPEC_H/SPEC_I so
   // shared memory is sized to the model, not compile-time maxima). `key`
   // must uniquely identify (name + spec values); pipelines are cached by key.
@@ -174,15 +183,9 @@ int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
                      const void* data, size_t data_size,
                      const void* pc, size_t pc_size,
                      const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
-  void begin_if_needed();
-  void storage_barrier();
-  void dispatch(const char* name, const void* pc, size_t pc_size,
-                const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
-  // Same, but skips the trailing storage barrier. Only for runs of independent
-  // dispatches (disjoint outputs); the last one must barrier (or use dispatch).
-  void dispatch_nb(const char* name, const void* pc, size_t pc_size,
-                   const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
-  void dispatch_bound(VkPipeline p, const void* pc, size_t pc_size,
+   void begin_if_needed();
+   void storage_barrier();
+   void dispatch_bound(VkPipeline p, const void* pc, size_t pc_size,
                       const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz,
                       bool barrier = true);
   VkInstance inst_;

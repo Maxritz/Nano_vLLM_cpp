@@ -45,6 +45,24 @@ static bool try_mem_type(uint32_t typeFilter, VkMemoryPropertyFlags props, uint3
         }
     return false;
 }
+// ReBAR provision (the llama.cpp RDNA4 lesson): on a discrete GPU without
+// Resizable BAR the driver exposes a device-local type that is ALSO
+// host-visible, backed by a small (~256MB) slow BAR aperture. try_mem_type with
+// DEVICE_LOCAL alone can pick that slow type. Prefer a "pure" device-local type
+// (device-local and NOT host-visible) for GPU-resident buffers: it is never
+// slower than the host-visible one for GPU reads. No-op on UMA, where every
+// type shares one heap and the pure type is already listed first.
+static bool g_prefer_pure_devlocal = false;
+static bool try_mem_type_pure_devlocal(uint32_t typeFilter, uint32_t& out) {
+    for (uint32_t i = 0; i < g_memProps.memoryTypeCount; ++i) {
+        VkMemoryPropertyFlags f = g_memProps.memoryTypes[i].propertyFlags;
+        if ((typeFilter & (1u << i)) && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            out = i; return true;
+        }
+    }
+    return false;
+}
 static uint32_t find_mem_type(uint32_t typeFilter, VkMemoryPropertyFlags props) {
     uint32_t idx;
     if (try_mem_type(typeFilter, props, idx)) return idx;
@@ -65,7 +83,12 @@ static void vkrt_malloc(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* 
     VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.allocationSize = mr.size;
     uint32_t idx;
-    if (!try_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, idx) &&
+    // Prefer the pure device-local type (not host-visible) so a dGPU without
+    // ReBAR never lands GPU-resident buffers in the slow BAR aperture. Falls
+    // back to any device-local, then host-visible. No-op on UMA (single heap,
+    // pure type listed first).
+    if (!(g_prefer_pure_devlocal && try_mem_type_pure_devlocal(mr.memoryTypeBits, idx)) &&
+        !try_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, idx) &&
         !try_mem_type(mr.memoryTypeBits,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, idx)) {
         std::fprintf(stderr, "VK: no device-local or host-visible memory for %lld bytes\n", (long long)bytes);
@@ -244,6 +267,16 @@ VulkanBackend::VulkanBackend(VkInstance inst, VkPhysicalDevice pd, VkPhysicalDev
       is_amd_(is_amd), is_rdna4_(is_rdna4) {
     g_dev = dev_;
     g_memProps = rt_->memProps;
+    if (std::getenv("NANO_DEBUG")) {
+        std::fprintf(stderr, "[T] deviceType=%d memtypes=%u heaps=%u\n",
+                     (int)props.deviceType, g_memProps.memoryTypeCount, g_memProps.memoryHeapCount);
+        for (uint32_t i = 0; i < g_memProps.memoryTypeCount; ++i) {
+            const auto& mt = g_memProps.memoryTypes[i];
+            std::fprintf(stderr, "[T]   memtype %u: flags=0x%x heap=%u size=%.2fGB\n", i,
+                         (unsigned)mt.propertyFlags, mt.heapIndex,
+                         g_memProps.memoryHeaps[mt.heapIndex].size / 1e9);
+        }
+    }
     g_qfi = qfi_;
     vkGetDeviceQueue(dev_, qfi_, 0, &q_);
     g_q = q_;
@@ -391,7 +424,7 @@ void VulkanBackend::dispatch_bound(VkPipeline p,
     push_fn_(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout_, 0, (uint32_t)nbufs, writes);
     if (pc && pc_size) vkCmdPushConstants(cmd_, pipe_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size, pc);
     vkCmdDispatch(cmd_, gx, gy, gz);
-    if (barrier || std::getenv("NANO_BARRIER")) storage_barrier();
+    if (!std::getenv("NANO_NO_BARRIER") && (barrier || std::getenv("NANO_BARRIER"))) storage_barrier();
 }
 
 void VulkanBackend::begin_if_needed() {
@@ -594,6 +627,14 @@ std::unique_ptr<VulkanBackend> VulkanBackend::Create(bool force_device_local) {
     rt->device = dev; rt->physDev = pd; rt->queue = q; rt->qfi = qfi;
     vkGetPhysicalDeviceMemoryProperties(pd, &rt->memProps);
     g_memProps = rt->memProps;
+    // ReBAR provision: on a discrete GPU the driver may expose a device-local
+    // type that is also host-visible (the ~256MB BAR aperture without Resizable
+    // BAR). GPU-resident buffers must avoid it. force_device_local is set for
+    // AMD/IMG dGPUs at the call site; any discrete GPU benefits.
+    g_prefer_pure_devlocal = force_device_local || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    if (std::getenv("NANO_DEBUG"))
+        std::fprintf(stderr, "[T] prefer_pure_devlocal=%d (force=%d type=%d)\n",
+                     (int)g_prefer_pure_devlocal, (int)force_device_local, (int)props.deviceType);
 
     auto* b = new VulkanBackend(inst, pd, props, dev, rt, qfi,
                                 props.vendorID == 0x1002u || props.vendorID == 0x1023u,
@@ -608,6 +649,9 @@ void VulkanBackend::matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool 
     struct PC { int m, n, k; int bf16; uint32_t w_off; } pc{ m, n, k, bf16 ? 1 : 0, w_off };
     VkDeviceSize wbyte = (VkDeviceSize)w_off * 2;
     BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, w.buffer, wbyte, 0}, {2, y.buffer, y_off, y_range} };
+    // f16 GEMV measured WORSE than the tiled kernel (9.16 vs 11.32 tok/s):
+    // 4 lanes per column underfills the device while adding reduction barriers.
+    // Disabled until the K-quant GEMV's lane policy is settled.
     if (barrier_after) dispatch("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
     else dispatch_nb("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
 }
@@ -643,8 +687,13 @@ void VulkanBackend::matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, i
     // descriptor alone).
     struct PC { int m, n, k; int kind; uint32_t woff; uint32_t yoff; } pc{ m, n, k, kind, (uint32_t)wbyte_off, 0u };
     BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, wq.buffer, 0, 0}, {2, y.buffer, y_off, y_range} };
-    if (barrier_after) dispatch("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
-    else dispatch_nb("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
+    // Decode (m small): the 16x16 tile wastes 15/16 of the M-dim and scatters
+    // weight loads across cache lines; the GEMV splits lanes along K instead so
+    // weight bytes stream sequentially. Prefill keeps the tiled kernel.
+    const bool gemv = m <= 4 && (size_t)k * n >= 256u;
+    const char* name = gemv ? "matmul_qk_gemv" : "matmul_qk";
+    if (barrier_after) dispatch(name, &pc, sizeof(pc), bufs, 3, ru(n,16)/16, gemv ? (unsigned)m : ru(m,16)/16, 1);
+    else dispatch_nb(name, &pc, sizeof(pc), bufs, 3, ru(n,16)/16, gemv ? (unsigned)m : ru(m,16)/16, 1);
 }
 void VulkanBackend::rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after, VkDeviceSize xy_off) {
     struct PC { int rows, hidden; float eps; } pc{ rows, hidden, eps };

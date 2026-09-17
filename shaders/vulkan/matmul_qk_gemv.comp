@@ -1,0 +1,139 @@
+// Decode GEMV for K-quants (M small).
+//
+// Root cause of the decode gap (measured): the 16x16 tiled kernel reads
+// wq[col*k + i] one lane per column, so adjacent lanes are k elements apart
+// (~294B at Q2_K) -> each 64B cache line yields ~1 useful byte. bw_probe puts
+// the coalesced ceiling at ~27.5 GB/s on this iGPU; the tiled kernel realises
+// ~3 GB/s. Fix: 4 lanes per output column walk a CONTIGUOUS quarter of that
+// column's packed blocks, so each lane's byte loads are sequential. 16 columns
+// per workgroup x 4 lanes = 64 lanes.
+//
+// Lane count per column is a deliberate compromise, not a free variable:
+// qwen2.5-0.5b has hidden=896 -> only 4 Q2_K blocks (k=896, 256 vals/block), so
+// exactly 1 block per lane. 16 lanes per column (tried) leaves 12/16 idle and
+// adds 4 reduction barriers; 64 lanes per column (tried) serialises too far.
+//
+// kind: 2=Q4_0(18B/blk,32 vals), 10=Q2_K(84B), 12=Q4_K(144B), 13=Q5_K(176B), 14=Q6_K(210B).
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 16, local_size_y = 4) in;   // 16 cols x 4 K-lanes
+layout(push_constant) uniform PC { int m, n, k; int kind; uint woff; uint yoff; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BWQ { uint8_t wq[]; };
+layout(std430, binding = 2) buffer BY { float y[]; };
+shared float red[16][4];      // partial sums: 16 cols x 4 K-lanes
+
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint exp = (h >> 10) & 0x1fu;
+    uint mant = h & 0x3ffu; uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else {
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    }
+    else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
+    return bits;
+}
+float qk_q2(uint base, uint i) {
+    uint g = i >> 4, j = i & 15u;
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 80u]) | (uint(wq[base + 81u]) << 8)));
+    float dmin = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 82u]) | (uint(wq[base + 83u]) << 8)));
+    uint sb = wq[base + g];
+    float dl = d * float(sb & 0xFu);
+    float ml = dmin * float(sb >> 4);
+    uint byte = (g >> 3) * 32u + (g & 1u) * 16u + j;
+    uint q = (wq[base + 16u + byte] >> (((g >> 1) & 3u) * 2u)) & 3u;
+    return dl * float(q) - ml;
+}
+float qk_q4_0(uint base, uint i) {
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base]) | (uint(wq[base + 1u]) << 8)));
+    uint nib = i < 16u ? (wq[base + 2u + i] & 0xFu) : (wq[base + 2u + i - 16u] >> 4);
+    return d * (float(nib) - 8.0);
+}
+float qk_q4(uint base, uint i) {
+    uint dh = uint(wq[base]) | (uint(wq[base + 1u]) << 8);
+    uint dmh = uint(wq[base + 2u]) | (uint(wq[base + 3u]) << 8);
+    float d = uintBitsToFloat(fp16_to_float_u(dh));
+    float dmin = uintBitsToFloat(fp16_to_float_u(dmh));
+    uint j = i >> 5, e = i & 31u;
+    uint b4 = base + 4u;
+    uint sc, mn;
+    if (j < 4u) { sc = wq[b4 + j] & 63u; mn = wq[b4 + j + 4u] & 63u; }
+    else { sc = (wq[b4 + j + 4u] & 0xFu) | ((wq[b4 + j - 4u] >> 6) << 4); mn = (wq[b4 + j + 4u] >> 4) | ((wq[b4 + j] >> 6) << 4); }
+    uint qb = wq[base + 16u + (j >> 1) * 32u + e];
+    uint q = (qb >> ((j & 1u) * 4u)) & 0xFu;
+    return d * float(sc) * float(q) - dmin * float(mn);
+}
+float qk_q5(uint base, uint i) {
+    uint group = i >> 6, slot = (i & 63u) >> 5, l = i & 31u;
+    uint is = group * 2u;
+    uint u1 = 1u << (group * 2u), u2 = 2u << (group * 2u);
+    uint b4 = base + 4u;
+    uint j = is + slot;
+    uint sc, mn;
+    if (j < 4u) { sc = wq[b4 + j] & 63u; mn = wq[b4 + j + 4u] & 63u; }
+    else { sc = (wq[b4 + j + 4u] & 0xFu) | ((wq[b4 + j - 4u] >> 6) << 4); mn = (wq[b4 + j + 4u] >> 4) | ((wq[b4 + j] >> 6) << 4); }
+    uint ql = base + 48u, qh = base + 16u;
+    uint qhl = wq[qh + l];
+    uint q = slot == 0u ? (wq[ql + group*32u + l] & 0xFu) : (wq[ql + group*32u + l] >> 4);
+    uint hbit = slot == 0u ? (qhl & u1) : (qhl & u2);
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base]) | (uint(wq[base + 1u]) << 8)));
+    float dmin = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 2u]) | (uint(wq[base + 3u]) << 8)));
+    return d * float(sc) * float(q + (hbit != 0u ? 16 : 0)) - dmin * float(mn);
+}
+float qk_q6(uint base, uint i) {
+    uint ha = i >> 7, t = i & 127u;
+    uint ql = base + ha * 64u, qh = base + 128u + ha * 32u, sb = base + 192u + ha * 8u;
+    uint dh = uint(wq[base + 208u]) | (uint(wq[base + 209u]) << 8);
+    float d = uintBitsToFloat(fp16_to_float_u(dh));
+    uint l = t & 31u, slot = t >> 5, is = l >> 4;
+    uint qhl = wq[qh + l];
+    uint q; int s;
+    uint su;
+    if (slot == 0u) { q = (wq[ql + l] & 0xFu) | (((qhl >> 0) & 3u) << 4); su = wq[sb + is]; }
+    else if (slot == 1u) { q = (wq[ql + l + 32u] & 0xFu) | (((qhl >> 2) & 3u) << 4); su = wq[sb + is + 2u]; }
+    else if (slot == 2u) { q = (wq[ql + l] >> 4) | (((qhl >> 4) & 3u) << 4); su = wq[sb + is + 4u]; }
+    else { q = (wq[ql + l + 32u] >> 4) | (((qhl >> 6) & 3u) << 4); su = wq[sb + is + 6u]; }
+    s = su > 127u ? int(su) - 256 : int(su);
+    return d * float(s) * (float(q) - 32.0);
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;          // column within the 16-col group
+    uint ty = gl_LocalInvocationID.y;          // K-lane within the 4-way split
+    uint col = gl_WorkGroupID.x * 16u + tx;    // output column
+    uint row = gl_WorkGroupID.y;               // input row (M batch)
+    if (col >= uint(pc.n)) { red[tx][ty] = 0.0; return; }
+    uint bb = pc.kind == 2 ? 18u : (pc.kind == 10 ? 84u : (pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u)));
+    uint elems = pc.kind == 2 ? 32u : 256u;    // values per packed block
+    // Each of the 4 K-lanes owns a contiguous quarter of the row.
+    uint kper = (uint(pc.k) + 3u) / 4u;
+    uint k0 = ty * kper, k1 = min(k0 + kper, uint(pc.k));
+    float acc = 0.0;
+    // Walk packed blocks sequentially: sequential byte offsets = coalesced loads.
+    uint b0 = k0 / elems, b1 = (k1 + elems - 1u) / elems;
+    for (uint b = b0; b < b1; ++b) {
+        uint i0 = b == b0 ? (k0 - b * elems) : 0u;
+        uint i1 = (b + 1u == b1) ? min(k1 - b * elems, elems) : elems;
+        for (uint i = i0; i < i1; ++i) {
+            float wv = (pc.kind == 2) ? qk_q4_0(b*bb + pc.woff, i)
+                : ((pc.kind == 10) ? qk_q2(b*bb + pc.woff, i)
+                : ((pc.kind == 12) ? qk_q4(b*bb + pc.woff, i)
+                : (pc.kind == 13 ? qk_q5(b*bb + pc.woff, i) : qk_q6(b*bb + pc.woff, i))));
+            uint ki = b * elems + i;
+            acc += x[row*uint(pc.k) + ki] * wv;
+        }
+    }
+    red[tx][ty] = acc;
+    barrier();
+    if (ty == 0u) {
+        float s = red[tx][0] + red[tx][1] + red[tx][2] + red[tx][3];
+        y[row*uint(pc.n) + col + pc.yoff/4u] = s;
+    }
+}

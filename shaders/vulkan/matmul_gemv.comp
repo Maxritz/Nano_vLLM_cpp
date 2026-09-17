@@ -1,0 +1,54 @@
+// Decode GEMV for f16/bf16 weights (M small). Same M=1 pathology as the K-quant
+// GEMV: the 16x16 tile reads w[col*k+bk] with adjacent lanes k elements apart,
+// so each 64B cache line serves ~1 useful fp16. Here 16 lanes split the K range
+// of one output column; each lane walks a contiguous run so fp16 loads stream.
+// One workgroup computes 16 output columns for M rows.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 16, local_size_y = 4) in;   // 16 cols x 4 K-lanes
+layout(push_constant) uniform PC { int m, n, k; int bf16; uint w_off; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BW { uint16_t w[]; };
+layout(std430, binding = 2) buffer BY { float y[]; };
+shared float red[16][4];
+
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint exp = (h >> 10) & 0x1fu;
+    uint mant = h & 0x3ffu; uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else {
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    }
+    else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
+    return bits;
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint col = gl_WorkGroupID.x * 16u + tx;
+    uint row = gl_WorkGroupID.y;
+    if (col >= uint(pc.n)) { red[tx][ty] = 0.0; return; }
+    // w_off is a weight-element offset carried by the descriptor; x is indexed
+    // from the buffer base (row-major, no weight offset).
+    uint xbase = row * uint(pc.k);
+    uint kper = (uint(pc.k) + 3u) / 4u;
+    uint k0 = ty * kper, k1 = min(k0 + kper, uint(pc.k));
+    float acc = 0.0;
+    for (uint k = k0; k < k1; ++k) {
+        uint h = w[col*uint(pc.k) + k];
+        float wv = uintBitsToFloat(pc.bf16 != 0 ? h << 16u : fp16_to_float_u(h));
+        acc += x[xbase + k] * wv;
+    }
+    red[tx][ty] = acc;
+    barrier();
+    if (ty == 0u) {
+        y[row*uint(pc.n) + col] = red[tx][0] + red[tx][1] + red[tx][2] + red[tx][3];
+    }
+}

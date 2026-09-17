@@ -1,0 +1,30 @@
+// Raw device-memory read bandwidth probe. N global lanes each walk the buffer
+// with stride = lane count, so every word is read exactly once per pass and
+// adjacent lanes touch consecutive words (coalesced). Reports the ceiling any
+// weight-streaming kernel can approach.
+//
+// ponytail: the first version hardcoded stride 65536 while dispatching only
+// 4096 lanes, so 15/16 of the buffer was skipped and GB/s was inflated 16x.
+// The stride is now a push constant tied to the actual dispatch size.
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint nwords; uint stride; uint passes; } pc;
+layout(std430, binding = 0) buffer BS { uint s[]; };
+layout(std430, binding = 1) buffer BD { uint d[]; };
+shared uint acc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint sum = 0u;
+    for (uint p = 0u; p < pc.passes; ++p) {
+        for (uint i = id; i < pc.nwords; i += pc.stride) {
+            sum += s[i];
+        }
+    }
+    if (gl_LocalInvocationIndex == 0u) acc = 0u;
+    barrier();
+    atomicAdd(acc, sum);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) d[gl_WorkGroupID.x] = acc;
+}

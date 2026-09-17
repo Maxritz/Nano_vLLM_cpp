@@ -697,14 +697,31 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
 
     const VkDeviceSize q_off = 0, k_off = (VkDeviceSize)rows * q_size_ * F4;
     const bool pipe_dbg = std::getenv("NANO_PIPE") != nullptr;
+    // NaN/garbage guard: pipe_tag flags non-finite values so a fusion or offset
+    // bug surfaces at the first corrupted stage instead of silently degrading
+    // output. NANO_PIPE_LAYERS=all (or N) extends per-layer tags past L0.
+    static const int pipe_layers = []() {
+        const char* s = std::getenv("NANO_PIPE_LAYERS");
+        if (!s) return 0;
+        if (!strcmp(s, "all")) return 100000;
+        return std::atoi(s);
+    }();
     auto pipe_tag = [&](const char* stage, const VBuf& b, size_t floats, VkDeviceSize byte_off = 0) {
         if (!pipe_dbg) return;
         dev_->submit_wait();
         std::vector<float> v(std::max<size_t>(floats, 1));
         b.download_at(byte_off, v.data(), v.size() * F4);
-        double sum = 0.0; for (float x : v) sum += x;
-        std::fprintf(stderr, "[PIPE vk %s] n=%zu sum=%.6f first=%.6f,%.6f,%.6f\n",
-                     stage, v.size(), sum, v[0], v[1], v[2]);
+        double sum = 0.0; long n_nan = 0, n_inf = 0;
+        for (float x : v) {
+            if (std::isnan(x)) { ++n_nan; continue; }
+            if (std::isinf(x)) { ++n_inf; continue; }
+            sum += x;
+        }
+        const bool bad = n_nan || n_inf;
+        std::fprintf(stderr, "[PIPE vk %s] n=%zu sum=%.6f first=%.6f,%.6f,%.6f%s\n",
+                     stage, v.size(), sum, v[0], v[1], v[2],
+                     bad ? n_nan ? " *** NaN ***" : " *** Inf ***" : "");
+        if (bad) { std::fflush(stderr); }
     };
     dev_->embedding(d_ids, embed_, hidden_dev, rows, hidden);
     pipe_tag("embed", hidden_dev, (size_t)rows * hidden);

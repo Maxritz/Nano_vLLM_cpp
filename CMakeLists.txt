@@ -165,3 +165,10 @@ target_compile_options(vk_golden_test PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/O2 /wd4100 /wd4101>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations>)
 target_link_libraries(vk_golden_test PRIVATE Vulkan::Vulkan)
+
+add_executable(bw_probe test/bw_probe.cpp src/vulkan_backend.cpp src/gguf.cpp src/safetensors.cpp)
+target_include_directories(bw_probe PRIVATE include test "${Vulkan_INCLUDE_DIR}")
+target_compile_options(bw_probe PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/O2 /wd4100 /wd4101>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations>)
+target_link_libraries(bw_probe PRIVATE Vulkan::Vulkan)
