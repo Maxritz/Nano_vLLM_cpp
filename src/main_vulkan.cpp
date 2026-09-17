@@ -36,6 +36,7 @@ static void usage(const char* prog) {
   std::fprintf(stderr, "       [--chat] [--repl] [--temperature T] [--top-p P]\n");
   std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W] [--system S]\n");
   std::fprintf(stderr, "       [--bench N] [--vram] [--rope-scale F] [--ctx-window N]\n");
+  std::fprintf(stderr, "       [--prefill-chunk C]\n");
   std::fprintf(stderr, "       <model_dir> --server [host] [port]\n");
   std::fprintf(stderr, "  Sampling defaults come from generation_config.json when present;\n");
   std::fprintf(stderr, "  explicit flags always win. --rep-penalty divides the logits of ids\n");
@@ -45,6 +46,36 @@ static void usage(const char* prog) {
 }
 
 // SAMP-1: sample_row lives in nanovllm/sampler.hpp (with SAMP_TEST asserts).
+
+// PF-1: chunked prefill. Splits ids into chunks of `chunk` tokens (chunk<=0 =
+// one pass, exactly today's behavior) and forwards each in order; KV
+// accumulates via absolute slots so the last chunk's row equals a full
+// prefill's row. Returns the last-chunk logits (one row).
+static std::vector<float> prefill_logits(VulkanModel& model, const std::vector<int>& ids,
+                                         int base_pos, int bsize, int max_blocks, int chunk) {
+  int n = (int)ids.size();
+  std::vector<int32_t> bt(max_blocks, -1);
+  for (int i = 0; i < n; ++i) { int s = base_pos + i; bt[s / bsize] = (int32_t)(s / bsize); }
+  std::vector<float> last;
+  int c = chunk > 0 ? chunk : n;
+  for (int off = 0; off < n; off += c) {
+    int len = std::min(c, n - off);
+    VKContext ctx;
+    ctx.input_ids.assign(ids.begin() + off, ids.begin() + off + len);
+    ctx.positions.resize(len);
+    for (int i = 0; i < len; ++i) ctx.positions[i] = base_pos + off + i;
+    ctx.slot_mapping.resize(len);
+    for (int i = 0; i < len; ++i) ctx.slot_mapping[i] = (int32_t)(base_pos + off + i);
+    ctx.block_tables = bt;
+    ctx.query_seq = std::vector<int32_t>(len, 0);
+    ctx.query_key_len.resize(len);
+    for (int i = 0; i < len; ++i) ctx.query_key_len[i] = base_pos + off + i + 1;
+    ctx.last_indices = {len - 1};
+    ctx.max_blocks = max_blocks;
+    last = model.forward_logits(ctx);
+  }
+  return last;
+}
 
 // REPL-1: one generation turn over the shared KV cache. `out` is the running
 // generated-token history (across turns) so the model keeps conversational
@@ -56,31 +87,12 @@ static std::string run_turn(VulkanModel& model, const Config& config, const Toke
                             double temperature, double top_p, double rep_penalty, int rep_window,
                             int max_tokens, std::mt19937& rng,
                             const drafter::NgramIndex* draft = nullptr, int draft_k = 8,
-                            int draft_n = 2) {
+                            int draft_n = 2, int prefill_chunk = 0) {
   int bsize = config.kvcache_block_size;
   int max_blocks = 64;
-  std::vector<int32_t> bt(max_blocks, -1);
   // Absolute slots: append this turn's prompt after the retained history.
-  for (size_t i = 0; i < prompt_ids.size(); ++i) {
-    int slot = pos + (int)i;
-    bt[slot / bsize] = (int32_t)(slot / bsize);
-  }
-
-  VKContext ctx;
   int n = (int)prompt_ids.size();
-  ctx.input_ids.assign(prompt_ids.begin(), prompt_ids.end());
-  ctx.positions.resize(n);
-  for (int i = 0; i < n; ++i) ctx.positions[i] = pos + i;
-  ctx.slot_mapping.resize(n);
-  for (int i = 0; i < n; ++i) ctx.slot_mapping[i] = (int32_t)(pos + i);
-  ctx.block_tables = bt;
-  ctx.query_seq = std::vector<int32_t>(n, 0);
-  ctx.query_key_len.resize(n);
-  for (int i = 0; i < n; ++i) ctx.query_key_len[i] = pos + i + 1;
-  ctx.last_indices = {n - 1};
-  ctx.max_blocks = max_blocks;
-
-  auto lg = model.forward_logits(ctx);
+  auto lg = prefill_logits(model, prompt_ids, pos, bsize, max_blocks, prefill_chunk);
   const float* row = &lg[0];
   int nxt = sample_row(row, config.hf.vocab_size, temperature, top_p, rng,
                        out.data(), out.size(), rep_penalty, rep_window);
@@ -268,6 +280,7 @@ int main(int argc, char** argv) {
     bool ropescale_set = false;
     int ctx_window = 0;              // ATTN-1/PLUG-2: CLI override for sliding_window (0 = use config file)
     bool ctxwin_set = false;
+    int prefill_chunk = 0;           // PF-1: prefill chunk size (0 = one pass)
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -295,6 +308,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
       else if (a == "--draft-k" && i + 1 < argc) draft_k = std::atoi(argv[++i]);
       else if (a == "--rope-scale" && i + 1 < argc) { rope_scale = std::atof(argv[++i]); ropescale_set = true; }
       else if (a == "--ctx-window" && i + 1 < argc) { ctx_window = std::atoi(argv[++i]); ctxwin_set = true; }
+      else if (a == "--prefill-chunk" && i + 1 < argc) prefill_chunk = std::atoi(argv[++i]);
       else if (a == "--server") server_mode = true;
       else if (server_mode && server_host == "127.0.0.1" && argv[i][0] != '-') {
         if (strchr(argv[i], '.')) server_host = argv[i];
@@ -406,23 +420,9 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
         int mt = req.max_tokens > 0 ? req.max_tokens : max_tokens;
         int rbsize = config.kvcache_block_size;
         int rmax_blocks = 64;
-        std::vector<int32_t> rbt(rmax_blocks, -1);
-        for (size_t i = 0; i < rids.size(); ++i) rbt[i / rbsize] = (int32_t)(i / rbsize);
         std::mt19937 rrng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
-        VKContext ctx;
         int n = (int)rids.size();
-        ctx.input_ids.assign(rids.begin(), rids.end());
-        ctx.positions.resize(n);
-        for (int i = 0; i < n; ++i) ctx.positions[i] = i;
-        ctx.slot_mapping.resize(n);
-        for (int i = 0; i < n; ++i) ctx.slot_mapping[i] = (int32_t)i;
-        ctx.block_tables = rbt;
-        ctx.query_seq = std::vector<int32_t>(n, 0);
-        ctx.query_key_len.resize(n);
-        for (int i = 0; i < n; ++i) ctx.query_key_len[i] = i + 1;
-        ctx.last_indices = {n - 1};
-        ctx.max_blocks = rmax_blocks;
-        auto lg = model.forward_logits(ctx);
+        auto lg = prefill_logits(model, rids, 0, rbsize, rmax_blocks, prefill_chunk);
         std::vector<int> rout;
         int pos = n;
         int nxt = sample_row(&lg[0], config.hf.vocab_size, temp, top_p, rrng,
@@ -552,7 +552,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
         if (turn_ids.empty()) continue;
         std::string reply = run_turn(model, config, tok, turn_ids, out, pos,
                                      temperature, top_p, rep_penalty, rep_window,
-                                     max_tokens, rng, &drafter, draft_k, draft_n);
+                                     max_tokens, rng, &drafter, draft_k, draft_n, prefill_chunk);
         // AGENT-1: tool-call loop.
         int iters = 0;
         while (max_iters > 0 && iters < max_iters) {
@@ -568,7 +568,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
           if (fids.empty()) break;
           reply = run_turn(model, config, tok, fids, out, pos,
                            temperature, top_p, rep_penalty, rep_window,
-                           max_tokens, rng);
+                           max_tokens, rng, nullptr, 8, 2, prefill_chunk);
           ++iters;
         }
         std::printf("%s\n", postprocess_reply(reply, strip_think, json_shape).c_str());
@@ -608,20 +608,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
 
     // Prefill
     {
-      VKContext ctx;
-      int n = (int)ids.size();
-      ctx.input_ids.assign(ids.begin(), ids.end());
-      ctx.positions.resize(n);
-      for (int i = 0; i < n; ++i) ctx.positions[i] = i;
-      ctx.slot_mapping.resize(n);
-      for (int i = 0; i < n; ++i) ctx.slot_mapping[i] = (int32_t)i;
-      ctx.block_tables = bt;
-      ctx.query_seq = std::vector<int32_t>(n, 0);
-      ctx.query_key_len.resize(n);
-      for (int i = 0; i < n; ++i) ctx.query_key_len[i] = i + 1;
-      ctx.last_indices = {n - 1};
-      ctx.max_blocks = max_blocks;
-      auto lg = model.forward_logits(ctx);
+      auto lg = prefill_logits(model, ids, 0, bsize, max_blocks, prefill_chunk);
       const float* row = &lg[0];
       if (getenv("NANO_DEBUG")) {
         std::vector<int> idx(config.hf.vocab_size);
