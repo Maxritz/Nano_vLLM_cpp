@@ -34,7 +34,7 @@ static void usage(const char* prog) {
   std::fprintf(stderr, "Usage: %s <model_dir> [prompt] [--max-tokens N] [--max-model-len N]\n", prog);
   std::fprintf(stderr, "       [--chat] [--repl] [--temperature T] [--top-p P]\n");
   std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W] [--system S]\n");
-  std::fprintf(stderr, "       [--bench N] [--vram] [--rope-scale F]\n");
+  std::fprintf(stderr, "       [--bench N] [--vram] [--rope-scale F] [--ctx-window N]\n");
   std::fprintf(stderr, "       <model_dir> --server [host] [port]\n");
   std::fprintf(stderr, "  Sampling defaults come from generation_config.json when present;\n");
   std::fprintf(stderr, "  explicit flags always win. --rep-penalty divides the logits of ids\n");
@@ -312,6 +312,8 @@ int main(int argc, char** argv) {
     int draft_k = 8;                 // DEC-2: draft length per step
     double rope_scale = 1.0;         // CTX-1: CLI override for rope_factor (0 = use config file)
     bool ropescale_set = false;
+    int ctx_window = 0;              // ATTN-1/PLUG-2: CLI override for sliding_window (0 = use config file)
+    bool ctxwin_set = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -338,6 +340,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
       else if (a == "--draft-n" && i + 1 < argc) draft_n = std::atoi(argv[++i]);
       else if (a == "--draft-k" && i + 1 < argc) draft_k = std::atoi(argv[++i]);
       else if (a == "--rope-scale" && i + 1 < argc) { rope_scale = std::atof(argv[++i]); ropescale_set = true; }
+      else if (a == "--ctx-window" && i + 1 < argc) { ctx_window = std::atoi(argv[++i]); ctxwin_set = true; }
       else if (a == "--server") server_mode = true;
       else if (server_mode && server_host == "127.0.0.1" && argv[i][0] != '-') {
         if (strchr(argv[i], '.')) server_host = argv[i];
@@ -358,6 +361,12 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
       config.hf.rope_factor = rope_scale;
       if (getenv("NANO_DEBUG"))
         std::fprintf(stderr, "[T] rope-scale override factor=%.3f\n", rope_scale);
+    }
+    // ATTN-1/PLUG-2: --ctx-window overrides sliding_window from the config file.
+    if (ctxwin_set) {
+      config.hf.sliding_window = ctx_window;
+      if (getenv("NANO_DEBUG"))
+        std::fprintf(stderr, "[T] ctx-window override window=%d\n", ctx_window);
     }
     // PROF-1: --profile chat|long|bench|default sets generation + KV-cache
     // defaults. CLI flags already set on those fields win over the profile.

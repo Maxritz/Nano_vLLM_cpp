@@ -26,6 +26,13 @@
 - [x] PROF-1 wiring: get()/names() into main_vulkan --profile
 - [x] CTX-1 --rope-scale: CLI override for rope_factor (CLI wins over rope_scaling{})
       (Verified: [T] rope-scale override factor=1.500 + [T] rope L0 factor=1.500.)
+- [x] ATTN-1 --ctx-window: CLI override for sliding_window (CLI wins over config
+      file). The full path was already plumbed (config fields + GGUF mapping +
+      model dispatch + shader mask); this wires the switch + a [T] attn trace.
+      (Verified: --ctx-window 8 -> [T] attn sw_start=N window=8 maxlen=N+8 per
+      decode step; flag absent -> zero sw traces, bit-identical output.)
+- [x] PLUG-2 --ctx-window: delivered via ATTN-1 override above. --kv-policy
+      stays parked: no policy DLL exists (load() always falls back to builtin).
 
 ## PENDING — engine work (13 items, not started)
 - [ ] SERV-2: embeddings endpoint + concurrent request batching (http_server.hpp + main_vulkan)
@@ -36,7 +43,7 @@
 - [ ] ATTN-4: mRoPE (qwen3-family; blocked on SSM+mRoPE)
 - [ ] QUANT-6: Q2_K native GPU kernel (shaders)
 - [ ] VERIFY workers: full golden matrix re-run after BOS fix (GPU==CPU all tags)
-- [ ] HIP re-mirror: src/model.cpp agent edits unverified, no ROCm toolchain here
+- [ ] HIP re-mirror: SIDELINED — full Vulkan is the goal; HIP/ROCm dormant until HW is available
 - [ ] 8GB-MoE (2/3): GGUF MoE naming (blk.N.ffn_*_exps) + lift gguf-only throw
 - [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place, bit-golden vs gguf-py
 - [ ] SAMP-1: verify sample_row's windowed rep_penalty vs spec

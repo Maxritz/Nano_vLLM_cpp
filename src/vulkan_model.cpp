@@ -720,6 +720,9 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
                 int maxlen = 0;
                 for (auto v : ctx.query_key_len) maxlen = std::max(maxlen, (int)v);
                 if (maxlen > hf.sliding_window) sw_start = maxlen - hf.sliding_window;
+                if (getenv("NANO_DEBUG") && layer == 0 && sw_start > 0)
+                    std::fprintf(stderr, "[T] attn sw_start=%d window=%d maxlen=%d\n",
+                                 sw_start, hf.sliding_window, maxlen);
             }
             dev_->paged_attention_ex(q_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
                                      rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale,
