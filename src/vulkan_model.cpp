@@ -844,6 +844,26 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
     return out;
 }
 
+std::vector<float> VulkanModel::embed_text(const std::vector<int>& ids) {
+    if (!ready_) throw std::runtime_error("model weights not loaded");
+    int hidden = config_.hf.hidden_size;
+    int rows = (int)ids.size();
+    if (rows <= 0 || hidden <= 0) return {};
+    VBuf d_ids = dev_->make(ids);
+    VBuf h; h.alloc((VkDeviceSize)rows * hidden * sizeof(float));
+    dev_->embedding(d_ids, embed_, h, rows, hidden);
+    dev_->submit_wait();
+    std::vector<float> all((size_t)rows * hidden);
+    h.download(all.data(), (VkDeviceSize)all.size() * sizeof(float));
+    std::vector<float> mean(hidden, 0.0f);
+    for (int r = 0; r < rows; ++r)
+        for (int j = 0; j < hidden; ++j) mean[j] += all[(size_t)r * hidden + j];
+    for (int j = 0; j < hidden; ++j) mean[j] /= rows;
+    if (getenv("NANO_DEBUG"))
+        std::fprintf(stderr, "[T] embed rows=%d hidden=%d mean0=%.6f\n", rows, hidden, mean[0]);
+    return mean;
+}
+
 std::string VulkanModel::memory_report() const {
   std::ostringstream ss;
   const VkRT* rt = dev_ ? dev_->rt() : nullptr;

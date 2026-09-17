@@ -84,6 +84,10 @@ public:
     // Returns host logits [out_rows, vocab]. One batched Vulkan submission.
     std::vector<float> forward_logits(const VKContext& ctx);
 
+    // SERV-2: mean-pooled input embeddings (static v1: embedding-table lookup
+    // only, no transformer pass). Empty input -> empty vector.
+    std::vector<float> embed_text(const std::vector<int>& ids);
+
     // PERF-2: one-line Vulkan heap report (per-heap size + flags) plus the
     // KV cache usage, for --vram. Reads dev_->rt()->memProps.
     std::string memory_report() const;

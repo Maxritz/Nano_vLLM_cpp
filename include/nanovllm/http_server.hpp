@@ -27,6 +27,7 @@ struct ChatRequest {
 };
 
 using Handler = std::function<std::string(const ChatRequest&)>;
+using EmbedHandler = std::function<std::vector<float>(const std::string&)>;
 
 inline std::string json_escape(const std::string& s) {
   std::string out;
@@ -89,6 +90,19 @@ inline std::string build_models_response(const std::string& model) {
   ss << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
      << "{\"object\":\"list\",\"data\":[{\"id\":\"" << json_escape(model)
      << "\",\"object\":\"model\",\"owned_by\":\"nanovllm\"}]}";
+  return ss.str();
+}
+
+inline std::string build_embedding_response(const std::string& model, const std::vector<float>& emb) {
+  std::ostringstream ss;
+  ss << "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+     << "{\"object\":\"list\",\"model\":\"" << json_escape(model) << "\",\"data\":[{\"index\":0,"
+     << "\"object\":\"embedding\",\"embedding\":[";
+  for (size_t i = 0; i < emb.size(); ++i) {
+    if (i) ss << ',';
+    ss << emb[i];
+  }
+  ss << "]}],\"usage\":{\"prompt_tokens\":0,\"total_tokens\":0}}";
   return ss.str();
 }
 
@@ -180,7 +194,8 @@ inline void send_all(SOCKET s, const std::string& data) {
   }
 }
 
-inline void handle_client(SOCKET client_sock, const std::string& model_name, Handler h) {
+inline void handle_client(SOCKET client_sock, const std::string& model_name, Handler h,
+                          EmbedHandler eh = nullptr) {
   std::string err;
   do {
     char buf[65536];
@@ -240,6 +255,12 @@ inline void handle_client(SOCKET client_sock, const std::string& model_name, Han
       try {
         response = build_chat_response(cr.model.empty() ? model_name : cr.model, h(cr));
       } catch (...) { err = http_status(500, "Internal Server Error"); break; }
+    } else if (method == "POST" && path == "/v1/embeddings" && eh) {
+      std::string input = json_extract_string(body, "input");
+      if (input.empty()) { err = http_status(400, "Bad Request"); break; }
+      try {
+        response = build_embedding_response(model_name, eh(input));
+      } catch (...) { err = http_status(500, "Internal Server Error"); break; }
     } else {
       err = (method == "GET" || method == "POST") ? http_status(404, "Not Found")
                                                   : http_status(405, "Method Not Allowed");
@@ -253,7 +274,7 @@ inline void handle_client(SOCKET client_sock, const std::string& model_name, Han
   closesocket(client_sock);
 }
 
-inline void serve(int port, const std::string& model_name, Handler h) {
+inline void serve(int port, const std::string& model_name, Handler h, EmbedHandler eh = nullptr) {
   WSADATA wsa;
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
   SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -272,7 +293,7 @@ inline void serve(int port, const std::string& model_name, Handler h) {
   while (true) {
     SOCKET client = accept(listen_sock, nullptr, nullptr);
     if (client == INVALID_SOCKET) continue;
-    std::thread(handle_client, client, model_name, h).detach();
+    std::thread(handle_client, client, model_name, h, eh).detach();
   }
 }
 

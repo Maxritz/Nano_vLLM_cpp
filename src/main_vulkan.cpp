@@ -407,8 +407,15 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
     }
     if (server_mode) {
       // SERV-1: OpenAI-compatible loop. One request at a time (mutex guards
-      // the shared KV cache; concurrent batching is SERV-2).
+      // the shared GPU stream; connections are concurrent, inference serial).
       std::mutex srv_mu;
+      // SERV-2: /v1/embeddings (mean-pooled input embeddings, raw text).
+      minihttp::EmbedHandler embedder = [&](const std::string& input) -> std::vector<float> {
+        std::lock_guard<std::mutex> lk(srv_mu);
+        std::vector<int> eids = tok.encode_text(input);
+        if (eids.empty()) throw std::runtime_error("empty embedding input");
+        return model.embed_text(eids);
+      };
       minihttp::Handler handler = [&](const minihttp::ChatRequest& req) -> std::string {
         std::lock_guard<std::mutex> lk(srv_mu);
         std::string text = req.last_user;
@@ -451,7 +458,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
         }
         return text_out;
       };
-      minihttp::serve(server_port, model_dir, handler);
+      minihttp::serve(server_port, model_dir, handler, embedder);
       return 0;
     }
     if (use_chat) {
