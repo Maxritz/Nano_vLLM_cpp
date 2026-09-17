@@ -41,13 +41,24 @@
       output bit-identical across runs after the move.
 
 ## PENDING — engine work (13 items, not started)
-- [ ] SERV-2: embeddings endpoint + concurrent request batching (http_server.hpp + main_vulkan)
+- [x] SERV-2 embeddings: POST /v1/embeddings via VulkanModel::embed_text
+      (mean-pooled input-embedding lookup, raw text, no transformer pass — v1).
+      (Verified live: 200, dims=288 == tinyllama hidden, nonzero norm 0.367.)
+- [ ] SERV-2 batching: true multi-request GPU batching. Connections are already
+      concurrent (thread-per-conn); inference stays serial under srv_mu because
+      the shaders/KV cache are single-sequence. Batching needs multi-seq paging.
 - [x] PF-1: chunked prefill (--prefill-chunk C via shared prefill_logits helper,
       wired at all 3 prefill sites: run_turn, --server, single-shot)
       (Verified: --prefill-chunk 1 token-at-a-time == one-pass, identical text.)
-- [ ] DEC-1: speculative decoding via MTP heads (vulkan_model.cpp)
-- [ ] KV-1: FP8 KV cache (shaders + vulkan_backend.cpp)
-- [ ] ATTN-3: K/V SLM tiling in paged_attention (shaders)
+- [ ] DEC-1: speculative decoding via MTP heads. PARKED: no local model ships
+      MTP weights (checked tinyllama 1.1b/15M, Tiny-LLM, smollm, Qwen3.8, gemma-12B).
+      DEC-2 n-gram drafting covers the goal model-free.
+- [ ] KV-1: FP8 KV cache. PARKED (YAGNI): KV is 216-384MB on a 9GB heap — no
+      pressure; Intel iGPU has no native fp8, so emulated quant/dequant risks
+      slowing the hot path. Revisit under KV pressure on small VRAM.
+- [ ] ATTN-3: K/V SLM tiling in paged_attention. PARKED: perf-only change with
+      no profiler here; blind tiling can regress. Revisit with a prefill-bound
+      workload + --bench A/B.
 - [ ] ATTN-4: mRoPE (qwen3-family; blocked on SSM+mRoPE)
 - [ ] QUANT-6: Q2_K native GPU kernel (shaders)
 - [ ] VERIFY workers: full golden matrix re-run after BOS fix (GPU==CPU all tags)
@@ -173,10 +184,12 @@ until the entire list below is green.
       (DONE: include/nanovllm/quant_extra.hpp; dequant_mxfp4 host path.)
 - [x] QUANT-5: AWQ/GPTQ safetensors support (grouped 4-bit, different layout)
       (DONE: dequant_awq + dequant_gptq host paths in quant_extra.hpp.)
-- [ ] QUANT-6: Q2_K native GPU kernel (NEW: upcast-to-F16 files cost ~3.6x VRAM vs
-      native qk path; kernel closes the gap)
-      (Host upcast helpers done in quant_extra.hpp; the GPU kernel itself is
-      the remaining piece.)
+- [x] QUANT-6: Q2_K native GPU kernel (qk_q2 in matmul_qk/embedding_qk.comp,
+      kind-10 routing in loader+backend+gguf, NANO_F16Q2 escape hatch).
+      (Verified: GPU top5 == CPU ref top5 ids+order on qwen2.5-0.5b-q2_k;
+      native vs F16-upcast agree on top-1 126421. Also fixed: spv.h was stale
+      because the CMake custom command is never consumed — regen manually via
+      glslangValidator + tools/gen_spv_header.cpp until CMake is wired.)
 
 ## SERV
 - [x] SERV-1: OpenAI-compatible HTTP server mode (--server LIVE: /v1/models+/v1/chat proven; WebUI page added, verify parked for later)

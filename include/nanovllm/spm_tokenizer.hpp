@@ -270,12 +270,22 @@ std::vector<int> encode(const Vocab& v, const std::string& text) {
     std::vector<int> result;
     if (text.empty() || v.piece.empty()) return result;
 
-    size_t n = utf8_len(text);
+    // SPM input normalization: prepend U+2581 and map spaces to U+2581 so
+    // word-initial pieces (which carry the meta) match. Without this, any
+    // input containing spaces falls back to unk-per-char. Pieces match raw
+    // (meta included) against the normalized text.
+    static const char kMeta[4] = "\xE2\x96\x81";
+    std::string norm(kMeta);
+    for (char c : text) {
+        if (c == ' ') norm += kMeta;
+        else norm += c;
+    }
+
+    size_t n = utf8_len(norm);
     if (n == 0) return result;
 
-    // Build a map from piece string (without meta) to id for lookup
     // We'll do Viterbi: best_score[i] = best log-prob to reach position i
-    // For each position, try all pieces that match text[i..i+len(piece)]
+    // For each position, try all pieces that match norm[i..i+len(piece)]
 
     std::vector<float> best(n + 1, -1e30f);
     std::vector<int> best_prev(n + 1, -1);
@@ -288,7 +298,7 @@ std::vector<int> encode(const Vocab& v, const std::string& text) {
     for (size_t ci = 0; ci < n; ci++) {
         byte_pos[ci] = bi;
         bi++;
-        while (bi < text.size() && is_cont_byte((unsigned char)text[bi])) bi++;
+        while (bi < norm.size() && is_cont_byte((unsigned char)norm[bi])) bi++;
     }
     byte_pos[n] = bi;
 
@@ -296,15 +306,14 @@ std::vector<int> encode(const Vocab& v, const std::string& text) {
         if (best[i] <= -1e29f) continue;
         for (size_t pid = 0; pid < v.piece.size(); pid++) {
             const std::string& p = v.piece[pid];
-            std::string stripped = strip_meta(p);
-            if (stripped.empty()) continue;
-            size_t plen = utf8_len(stripped);
+            if (p.empty()) continue;
+            size_t plen = utf8_len(p);
             if (i + plen > n) continue;
             // compare bytes
             size_t sp = byte_pos[i];
             size_t ep = byte_pos[i + plen];
-            if (ep - sp != stripped.size()) continue;
-            if (text.compare(sp, stripped.size(), stripped) != 0) continue;
+            if (ep - sp != p.size()) continue;
+            if (norm.compare(sp, p.size(), p) != 0) continue;
             float sc = (pid < v.score.size()) ? v.score[pid] : 0.0f;
             float val = best[i] + sc;
             if (val > best[i + plen]) {
@@ -317,9 +326,12 @@ std::vector<int> encode(const Vocab& v, const std::string& text) {
 
     // Backtrack
     if (best[n] <= -1e29f) {
-        // fallback: emit unk for each char
-        for (size_t i = 0; i < n; i++) {
+        // fallback: emit unk for each non-meta char
+        for (size_t i = 0; i < norm.size();) {
+            if (i + 3 <= norm.size() && starts_with_meta(norm.substr(i, 3))) { i += 3; continue; }
             result.push_back(v.unk_id);
+            i++;
+            while (i < norm.size() && is_cont_byte((unsigned char)norm[i])) i++;
         }
         return result;
     }

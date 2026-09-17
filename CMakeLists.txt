@@ -131,10 +131,8 @@ add_executable(rag_test test/rag_test.cpp)
 target_include_directories(rag_test PRIVATE include)
 add_executable(samp_test test/samp_test.cpp)
 target_include_directories(samp_test PRIVATE include)
-# Self-tests assert(): keep them live in Release (which defines NDEBUG).
-target_compile_options(samp_test PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/U"NDEBUG">
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+# Self-tests assert(): keep them live in Release (which defines NDEBUG,
+# otherwise every *_TEST passes vacuously).
 target_include_directories(drafter_test PRIVATE include)
 add_executable(cache_test test/cache_test.cpp)
 target_include_directories(cache_test PRIVATE include)
@@ -148,6 +146,13 @@ add_executable(kv_test test/kv_test.cpp)
 target_include_directories(kv_test PRIVATE include)
 add_executable(quant_test test/quant_test.cpp)
 target_include_directories(quant_test PRIVATE include)
+# Self-tests assert(): keep them live in Release (which defines NDEBUG,
+# otherwise every *_TEST passes vacuously).
+foreach(t agent_test reason_test gen_test lora_test drafter_test cache_test spm_test rope_test prof_test kv_test quant_test rag_test samp_test)
+  target_compile_options(${t} PRIVATE
+      $<$<CXX_COMPILER_ID:MSVC>:/U"NDEBUG">
+      $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+endforeach()
 add_executable(vk_golden_test test/vk_golden_test.cpp src/vulkan_backend.cpp src/vulkan_model.cpp
     src/gguf.cpp src/safetensors.cpp src/tokenizer.cpp)
 target_include_directories(vk_golden_test PRIVATE include test "${Vulkan_INCLUDE_DIR}")

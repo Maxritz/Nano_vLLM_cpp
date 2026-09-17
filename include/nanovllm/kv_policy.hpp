@@ -93,9 +93,10 @@ inline void unload(Policy& p) {
 #include <iostream>
 
 int main() {
-    // Test 1: builtin_streaming().key_len(5, 3, 1) == 3
+    // Test 1: builtin_streaming().key_len(5, 3, 1) == 1 + min(3, 5) == 4
+    // (StreamingLLM: sink tokens always kept + recent window).
     auto bs = kvpolicy::builtin_streaming();
-    assert(bs.key_len(5, 3, 1) == 3);
+    assert(bs.key_len(5, 3, 1) == 4);
     // window<=0 -> identity
     assert(bs.key_len(5, -1, 1) == 6);
     // map tail-fills to -1
