@@ -1,0 +1,71 @@
+// Decode GEMV for Q8_0 weights (M small). Same M=1 pathology as the K-quant
+// GEMV: matmul_q8's 16x16 tile reads w8[col*k+bk] one lane per column, so
+// adjacent lanes are k bytes apart -> ~1 useful byte per 64B cache line (the
+// measured ceiling is ~25 GB/s; the tile realises ~3). Here 4 lanes per output
+// column walk a contiguous quarter of that column's Q8_0 row: int8 loads are
+// sequential, and the fp16 row-scale broadcasts once per 32 values.
+//
+// Q8_0 layout: [fp16 d][32 x int8 q] per 32 values (34 bytes, padded to 36 in
+// some builds; we index by the block base so either works).
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 16, local_size_y = 4) in;   // 16 cols x 4 K-lanes
+layout(push_constant) uniform PC { int m, n, k; uint w_off; uint ws_off; } pc;
+layout(std430, binding = 0) buffer BX { float x[]; };
+layout(std430, binding = 1) buffer BW8  { uint8_t  w8[]; };
+layout(std430, binding = 2) buffer BWS16 { uint16_t ws[]; };
+layout(std430, binding = 3) buffer BY { float y[]; };
+shared float red[16][4];
+
+uint fp16_to_float_u(uint h) {
+    uint sign = (h & 0x8000u) << 16;
+    uint exp = (h >> 10) & 0x1fu;
+    uint mant = h & 0x3ffu; uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign; }
+        else {
+            uint e = 127u - 14u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    }
+    else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
+    else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
+    return bits;
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;          // column within the 16-col group
+    uint ty = gl_LocalInvocationID.y;          // K-lane within the 4-way split
+    uint col = gl_WorkGroupID.x * 16u + tx;    // output column
+    uint row = gl_WorkGroupID.y;               // input row (M batch)
+    if (col >= uint(pc.n)) { red[tx][ty] = 0.0; return; }
+    // Each of the 4 K-lanes owns a contiguous quarter of the row.
+    uint kper = (uint(pc.k) + 3u) / 4u;
+    uint k0 = ty * kper, k1 = min(k0 + kper, uint(pc.k));
+    float acc = 0.0;
+    // Weight is [n][k] row-major with the scale header stripped: column `col`
+    // owns elements [col*k, (col+1)*k), laid out as col*k/32 Q8_0 blocks. Each
+    // of the 4 K-lanes walks a contiguous quarter of that column's blocks, so
+    // int8 loads stream sequentially within a lane.
+    uint nb_total = (uint(pc.k) + 31u) / 32u;
+    uint b0 = col * nb_total + k0 / 32u;
+    uint b1 = col * nb_total + (k1 + 31u) / 32u;
+    for (uint b = b0; b < b1; ++b) {
+        float d = uintBitsToFloat(fp16_to_float_u(ws[pc.ws_off + b]));
+        uint qbase = pc.w_off + b * 32u;
+        uint ki_base = (b - col * nb_total) * 32u;
+        uint i0 = (b == b0) ? (k0 - ki_base) : 0u;
+        uint i1 = (b + 1u == b1) ? min(k1 - ki_base, 32u) : 32u;
+        for (uint i = i0; i < i1; ++i) {
+            float q = float(int8_t(w8[qbase + i]));
+            acc += x[row*uint(pc.k) + ki_base + i] * (d * q);
+        }
+    }
+    red[tx][ty] = acc;
+    barrier();
+    if (ty == 0u) {
+        y[row*uint(pc.n) + col] = red[tx][0] + red[tx][1] + red[tx][2] + red[tx][3];
+    }
+}

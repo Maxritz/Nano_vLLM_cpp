@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -406,10 +408,28 @@ void VulkanBackend::ensure_pipeline_spec(const char* spv_name, const char* key,
     pipes_[key] = PipeEntry{ pipe };
 }
 
+// NANO_DISPATCH: per-kernel invocation counts for a submit (attributing the
+// fence time to the ops that fill the command buffer).
+static std::map<std::string, uint64_t>* g_dispatch_counts = nullptr;
+static std::map<std::string, uint64_t>* g_dispatch_work = nullptr;
+
 void VulkanBackend::dispatch_bound(VkPipeline p,
                                    const void* pc, size_t pc_size,
                                    const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz,
                                    bool barrier) {
+    if (std::getenv("NANO_DISPATCH")) {
+        // Aggregate invocations per kernel name: total workgroups dispatched.
+        // Not a cycle counter (fence time is the whole command buffer); this
+        // attributes the submit cost to the ops that fill it.
+        static std::map<std::string, uint64_t> counts, work;
+        const char* nm = "unknown";
+        for (auto& kv : pipes_) if (kv.second.pipe == p) { nm = kv.first.c_str(); break; }
+        counts[nm]++; work[nm] += (uint64_t)gx * gy * gz;
+        if (counts.size() && counts[nm] == 1u)
+            std::fprintf(stderr, "[D] first dispatch: %s grid=%ux%ux%u\n", nm, gx, gy, gz);
+        // Expose the table to submit_wait() via a file-scope accessor.
+        g_dispatch_counts = &counts; g_dispatch_work = &work;
+    }
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     VkDescriptorBufferInfo infos[8];
     VkWriteDescriptorSet writes[8];
@@ -467,6 +487,16 @@ void VulkanBackend::dispatch_spec(const char* spv_name, const char* key,
 
 void VulkanBackend::submit_wait() {
     if (!begun_) return;
+    if (std::getenv("NANO_DISPATCH") && g_dispatch_counts) {
+        std::fprintf(stderr, "[D] dispatch table (name count workgroups):\n");
+        uint64_t total = 0;
+        for (auto& kv : *g_dispatch_counts) {
+            std::fprintf(stderr, "[D]   %-20s %6llu  %llu\n", kv.first.c_str(),
+                         (unsigned long long)kv.second, (unsigned long long)(*g_dispatch_work)[kv.first]);
+            total += kv.second;
+        }
+        std::fprintf(stderr, "[D] total dispatches this submit: %llu\n", (unsigned long long)total);
+    }
     VKC(vkEndCommandBuffer(cmd_));
     begun_ = false;
     // Cross-family async uploads signal here: compute waits before reading them.
@@ -660,8 +690,12 @@ void VulkanBackend::matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, 
     struct PC { int m, n, k; uint32_t w_off; uint32_t ws_off; } pc{ m, n, k, w_off, ws_off };
     BufBind bufs[4] = { {0, x.buffer, 0, 0}, {1, w8.buffer, (VkDeviceSize)w_off, 0},
                         {2, ws.buffer, (VkDeviceSize)ws_off * 2, 0}, {3, y.buffer, y_off, y_range} };
-    if (barrier_after) dispatch("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
-    else dispatch_nb("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
+    // Decode (m small): GEMV streams int8 loads per column; prefill keeps the
+    // 16x16 tile.
+    const bool gemv = m <= 4 && (size_t)k * n >= 256u;
+    const char* name = gemv ? "matmul_q8_gemv" : "matmul_q8";
+    if (barrier_after) dispatch(name, &pc, sizeof(pc), bufs, 4, ru(n,16)/16, gemv ? (unsigned)m : ru(m,16)/16, 1);
+    else dispatch_nb(name, &pc, sizeof(pc), bufs, 4, ru(n,16)/16, gemv ? (unsigned)m : ru(m,16)/16, 1);
 }
 void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off, bool barrier_after, VkDeviceSize y_off, VkDeviceSize y_range) {
     if (!w.qk_segs.empty()) {
