@@ -162,7 +162,10 @@ until the entire list below is green.
 - [x] TOK-1: SPM-Unigram Viterbi decode/encode (Gemma/Llama SPM models).
       (DONE: include/nanovllm/spm_tokenizer.hpp; Viterbi encode/decode over
       piece ids, ▁=space meta handling, UTF-8 safe. SPM_TEST 3/3 pass.
-      REMAINING: wire into tokenizer.cpp so Gemma/Llama-SPM models load.)
+      WIRED + PROVEN: tokenizer.cpp unigram path (encode_unigram/spm_detokenize);
+      Tiny-LLM (merges=0) segments "Once upon a time" -> 8 tokens, GPU top5 ==
+      CPU ref top5 ids+order (logits within 0.001). Bonus: fixed a real
+      space-handling bug in spm::encode found by live asserts.)
 - [x] TOK-2: honor pre_tokenizer config from tokenizer.json (TikToken-style splits).
       State: poolside pre_tokenizer.hpp green (POSIX->ECMA + Isolated glue); WIRE
       GGUF tokenizer.ggml.pre=default -> llama regex.
@@ -245,6 +248,14 @@ until the entire list below is green.
       PROF_TEST 3/3 pass. REMAINING: wire get()/names() into main_vulkan --profile.)
 
 ## Verified this session (evidence trail)
+- tinyllama-15M "The capital of France is": vk_golden PASS (CPU-anchored 29892)
+- Tiny-LLM "Once upon a time": GPU == CPU ids+order (29892,310,29877,29891,278)
+- Llama-3.2-1B "Paris": GPU == CPU to 3 decimals (315,475,323,3936,374)
+- smollm-135m "Paris": GPU == CPU exact (28,30,56,4253,198)
+- MiniCPM5-1B-Q6_K "Paris": GPU == CPU exact (5,49,24,1307,45050) AFTER fixing
+  a real bug: the attn gate `if (qkv.f16||qkv.q8)` skipped attention entirely
+  for native-K-quant qkv (uninitialized attn). One-line fix (+qk_segs); prior
+  goldens byte-identical after. Loader now traces `[T] load <name> via q8/qk`.
 - tinyllama-q2k: GPU top5 == CPU ref top5 (8111,12126,4087,6492,23583)
 - attn_q Q2_K + attn_v Q4_K dequant == gguf-py canonical (sums + head values)
 - tokenizer ids == rebuilt-sentencepiece golden (all 13 ids exact)
