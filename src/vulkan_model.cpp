@@ -280,12 +280,16 @@ static bool q8_to_u16(const std::vector<uint8_t>& q8, std::vector<uint16_t>& u) 
 }
 void VulkanModel::load_matrix(const std::string& name, VMatrix& m, bool required, size_t n_elements) {
     std::vector<uint8_t> q8;
-    if (load_q8(name, q8)) { upload_q8_block(q8, m); m.f16.free(); m.qk.free(); m.qk_segs.clear(); return; }
+    auto lt = [&](const char* via) {
+        if (std::getenv("NANO_DEBUG"))
+            std::fprintf(stderr, "[T] load %s via %s\n", map_name(name).c_str(), via);
+    };
+    if (load_q8(name, q8)) { upload_q8_block(q8, m); m.f16.free(); m.qk.free(); m.qk_segs.clear(); lt("q8"); return; }
     for (int kind : {10, 12, 13, 14}) {
         if (kind == 10 && std::getenv("NANO_F16Q2")) continue;  // DBG tag: force Q2_K via F16 upcast
         if (kind == 14 && std::getenv("NANO_F16Q6")) continue;  // DBG tag: force Q6_K via F16 upcast
         std::vector<uint8_t> qk;
-         if (load_qk(name, kind, n_elements, qk)) { upload_qk_block(qk, kind, m); return; }
+         if (load_qk(name, kind, n_elements, qk)) { upload_qk_block(qk, kind, m); lt("qk"); return; }
     }
     std::vector<uint16_t> u; bool bf16 = false;
     if (load_u16(name, u, bf16)) { upload_u16_block(u, m); m.bf16 = bf16; return; }
@@ -685,7 +689,8 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
     for (int layer = 0; layer < hf.num_hidden_layers; ++layer) {
         auto& lw = layers_[layer];
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.input_ln, norm_dev, rows, hidden, eps);
-        if (lw.qkv.f16.buffer || lw.qkv.q8.buffer) {
+        // ATTN runs for any resident format (f16/upcast, q8, or native K-quant).
+        if (lw.qkv.f16.buffer || lw.qkv.q8.buffer || !lw.qkv.qk_segs.empty()) {
         dev_->matmul(norm_dev, lw.qkv, rows, q_size_, hidden, q_dev, 0u);
         dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, k_dev, (uint32_t)(q_size_ * hidden));
         dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, v_dev, (uint32_t)((q_size_ + kv_size_) * hidden));
