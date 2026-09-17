@@ -232,6 +232,9 @@ void VBuf::upload_at_async(VkDeviceSize offset, const void* host, VkDeviceSize b
 void VBuf::download(void* host, VkDeviceSize bytes) const {
     vkrt_download(buffer, 0, bytes, host);
 }
+void VBuf::download_at(VkDeviceSize offset, void* host, VkDeviceSize bytes) const {
+    vkrt_download(buffer, offset, bytes, host);
+}
 uint32_t VBuf::words() const { return uint32_t(nbytes / sizeof(uint32_t)); }
 
 // ---------- VulkanBackend ----------
@@ -388,7 +391,7 @@ void VulkanBackend::dispatch_bound(VkPipeline p,
     push_fn_(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout_, 0, (uint32_t)nbufs, writes);
     if (pc && pc_size) vkCmdPushConstants(cmd_, pipe_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size, pc);
     vkCmdDispatch(cmd_, gx, gy, gz);
-    if (barrier) storage_barrier();
+    if (barrier || std::getenv("NANO_BARRIER")) storage_barrier();
 }
 
 void VulkanBackend::begin_if_needed() {
@@ -600,23 +603,23 @@ std::unique_ptr<VulkanBackend> VulkanBackend::Create(bool force_device_local) {
 }
 
 // ── op dispatchers (bit-exact mirrors of hip_ops.hip; GLSL math matches) ─────
-void VulkanBackend::matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off, bool barrier_after) {
+void VulkanBackend::matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off, bool barrier_after, VkDeviceSize y_off, VkDeviceSize y_range) {
     if (m <= 0 || n <= 0 || k <= 0) return;
     struct PC { int m, n, k; int bf16; uint32_t w_off; } pc{ m, n, k, bf16 ? 1 : 0, w_off };
     VkDeviceSize wbyte = (VkDeviceSize)w_off * 2;
-    BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, w.buffer, wbyte, 0}, {2, y.buffer, 0, 0} };
+    BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, w.buffer, wbyte, 0}, {2, y.buffer, y_off, y_range} };
     if (barrier_after) dispatch("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
     else dispatch_nb("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
 }
-void VulkanBackend::matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off, uint32_t ws_off, bool barrier_after) {
+void VulkanBackend::matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off, uint32_t ws_off, bool barrier_after, VkDeviceSize y_off, VkDeviceSize y_range) {
     if (m <= 0 || n <= 0 || k <= 0) return;
     struct PC { int m, n, k; uint32_t w_off; uint32_t ws_off; } pc{ m, n, k, w_off, ws_off };
     BufBind bufs[4] = { {0, x.buffer, 0, 0}, {1, w8.buffer, (VkDeviceSize)w_off, 0},
-                        {2, ws.buffer, (VkDeviceSize)ws_off * 2, 0}, {3, y.buffer, 0, 0} };
+                        {2, ws.buffer, (VkDeviceSize)ws_off * 2, 0}, {3, y.buffer, y_off, y_range} };
     if (barrier_after) dispatch("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
     else dispatch_nb("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
 }
-void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off, bool barrier_after) {
+void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off, bool barrier_after, VkDeviceSize y_off, VkDeviceSize y_range) {
     if (!w.qk_segs.empty()) {
         const QKSeg* seg = &w.qk_segs[0];
         for (auto& s : w.qk_segs)
@@ -627,20 +630,25 @@ void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, ui
             std::fprintf(stderr, "VK: K-quant row split off super-block boundary\n"); std::exit(1);
         }
         VkDeviceSize wbyte = (VkDeviceSize)(seg->byte_off + (w_off - (uint32_t)seg->elem_off) / be * bb);
-        matmul_qk(x, w.qk, m, n, k, y, seg->kind, wbyte, barrier_after);
-    } else if (w.is_q8) matmul_q8(x, w.q8, w.qsc, m, n, k, y, w_off, w_off / 32, barrier_after);
-    else matmul(x, w.f16, m, n, k, y, w.bf16, w_off, barrier_after);
+        matmul_qk(x, w.qk, m, n, k, y, seg->kind, wbyte, barrier_after, y_off, y_range);
+    } else if (w.is_q8) matmul_q8(x, w.q8, w.qsc, m, n, k, y, w_off, w_off / 32, barrier_after, y_off, y_range);
+    else matmul(x, w.f16, m, n, k, y, w.bf16, w_off, barrier_after, y_off, y_range);
 }
-void VulkanBackend::matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off, bool barrier_after) {
+void VulkanBackend::matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off, bool barrier_after, VkDeviceSize y_off, VkDeviceSize y_range) {
     if (m <= 0 || n <= 0 || k <= 0) return;
-    struct PC { int m, n, k; int kind; uint32_t woff; } pc{ m, n, k, kind, (uint32_t)wbyte_off };
-    BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, wq.buffer, 0, 0}, {2, y.buffer, 0, 0} };
+    // The descriptor carries y_off (binding offset + y_range slice); the shader's
+    // y[] indexes from the descriptor base, so PC yoff must stay 0. Setting it to
+    // y_off would apply the offset twice (this was the Phi-3 NaN: K-quant qkv is
+    // the only matmul with a yoff PC field; f16/q8 place the offset in the
+    // descriptor alone).
+    struct PC { int m, n, k; int kind; uint32_t woff; uint32_t yoff; } pc{ m, n, k, kind, (uint32_t)wbyte_off, 0u };
+    BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, wq.buffer, 0, 0}, {2, y.buffer, y_off, y_range} };
     if (barrier_after) dispatch("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
     else dispatch_nb("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
 }
-void VulkanBackend::rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after) {
+void VulkanBackend::rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after, VkDeviceSize xy_off) {
     struct PC { int rows, hidden; float eps; } pc{ rows, hidden, eps };
-    BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, w.buffer, 0, 0}, {2, y.buffer, 0, 0} };
+    BufBind bufs[3] = { {0, x.buffer, xy_off, 0}, {1, w.buffer, 0, 0}, {2, y.buffer, xy_off, 0} };
     if (barrier_after) dispatch("rms_norm", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
     else dispatch_nb("rms_norm", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
 }
@@ -649,10 +657,10 @@ void VulkanBackend::rms_norm_add(VBuf& x, VBuf& residual, VBuf& w, VBuf& y, int 
     BufBind bufs[4] = { {0, x.buffer, 0, 0}, {1, residual.buffer, 0, 0}, {2, w.buffer, 0, 0}, {3, y.buffer, 0, 0} };
     dispatch("rms_norm_add", &pc, sizeof(pc), bufs, 4, rows, 1, 1);
 }
-void VulkanBackend::add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off, bool barrier_after) {
+void VulkanBackend::add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off, bool barrier_after, VkDeviceSize x_off) {
     struct PC { int rows, cols; } pc{ rows, cols };
     VkDeviceSize ob = (VkDeviceSize)row_off * sizeof(float);
-    BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, bias.buffer, ob, 0}, {2, x.buffer, 0, 0} };
+    BufBind bufs[3] = { {0, x.buffer, x_off, 0}, {1, bias.buffer, ob, 0}, {2, x.buffer, x_off, 0} };
     if (barrier_after) dispatch("add_bias", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
     else dispatch_nb("add_bias", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
 }
@@ -668,16 +676,17 @@ void VulkanBackend::scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols) {
     dispatch("scale_sigmoid", &pc, sizeof(pc), bufs, 2, rows, 1, 1);
 }
 void VulkanBackend::rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride,
-                         float rope_factor, float rope_beta, bool barrier_after) {
+                         float rope_factor, float rope_beta, bool barrier_after, VkDeviceSize data_off) {
     int total = tokens * heads * (head_dim/2); if (total <= 0) return;
-    struct PC { int tokens, heads, head_dim; int64_t stride; float rope_factor; float rope_beta; float rope_theta; } pc{ tokens, heads, head_dim, stride, rope_factor, rope_beta, 0.0f };
+    struct PC { int tokens, heads, head_dim; int64_t stride; float rope_factor; float rope_beta; float rope_theta; int data_off; } pc{ tokens, heads, head_dim, stride, rope_factor, rope_beta, 0.0f, (int)data_off };
     BufBind bufs[3] = { {0, data.buffer, 0, 0}, {1, pos.buffer, 0, 0}, {2, inv_freq.buffer, 0, 0} };
     if (barrier_after) dispatch("rope", &pc, sizeof(pc), bufs, 3, ru(total,256)/256, 1, 1);
     else dispatch_nb("rope", &pc, sizeof(pc), bufs, 3, ru(total,256)/256, 1, 1);
 }
 void VulkanBackend::store_kv(VBuf& key, VBuf& val, VBuf& k_cache, VBuf& v_cache, VBuf& slot_map,
-                             int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off, VkDeviceSize v_off) {
-    struct PC { int kv_heads, head_dim, total; } pc{ kv_heads, head_dim, total_tokens };
+                             int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off, VkDeviceSize v_off,
+                             int key_elem_off, int val_elem_off) {
+    struct PC { int kv_heads, head_dim, total; int key_off; int val_off; } pc{ kv_heads, head_dim, total_tokens, key_elem_off, val_elem_off };
     BufBind bufs[5] = { {0, key.buffer, 0, 0}, {1, val.buffer, 0, 0},
                         {2, k_cache.buffer, k_off * sizeof(float), 0}, {3, v_cache.buffer, v_off * sizeof(float), 0},
                         {4, slot_map.buffer, 0, 0} };
@@ -690,12 +699,12 @@ void VulkanBackend::paged_attention(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cac
                        block_size, max_blocks, scale, 0, 0.0f, k_off, v_off);
 }
 void VulkanBackend::paged_attention_ex(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
-                                    VBuf& bt, int tokens, int q_heads, int kv_heads, int head_dim,
-                                    int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
-                                    VkDeviceSize k_off, VkDeviceSize v_off) {
+                                     VBuf& bt, int tokens, int q_heads, int kv_heads, int head_dim,
+                                     int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
+                                     VkDeviceSize k_off, VkDeviceSize v_off, int q_off) {
     if (tokens <= 0 || q_heads <= 0 || kv_heads <= 0) return;
-    struct PC { int tokens, qh, kvh, hd, bs, mb; float scale; int sw_start; float softcap; } pc{ tokens, q_heads, kv_heads, head_dim, block_size, max_blocks, scale, sw_start, attn_softcap };
-    static_assert(sizeof(PC) == 36, "paged_attention PC must stay 36B (pipe_layout_ allows 64B)");
+    struct PC { int tokens, qh, kvh, hd, bs, mb; float scale; int sw_start; float softcap; int q_off; } pc{ tokens, q_heads, kv_heads, head_dim, block_size, max_blocks, scale, sw_start, attn_softcap, q_off };
+    static_assert(sizeof(PC) == 40, "paged_attention PC must stay 40B (pipe_layout_ allows 64B)");
     BufBind bufs[7] = { {0, q.buffer, 0, 0}, {1, y.buffer, 0, 0},
                         {2, k_cache.buffer, k_off * sizeof(float), 0}, {3, v_cache.buffer, v_off * sizeof(float), 0},
                         {4, qseq.buffer, 0, 0}, {5, qlen.buffer, 0, 0}, {6, bt.buffer, 0, 0} };

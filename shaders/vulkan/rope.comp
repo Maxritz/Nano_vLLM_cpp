@@ -5,7 +5,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 layout(local_size_x = 256) in;
-layout(push_constant) uniform PC { int tokens; int heads; int head_dim; int64_t stride; float rope_factor; float rope_beta; float rope_theta; } pc;
+layout(push_constant) uniform PC { int tokens; int heads; int head_dim; int64_t stride; float rope_factor; float rope_beta; float rope_theta; int data_off; } pc;
 layout(std430, binding = 0) buffer BDATA { float data[]; };
 layout(std430, binding = 1) buffer BPOS { int64_t positions[]; };
 layout(std430, binding = 2) buffer BFREQ { float inv_freq[]; };
@@ -26,7 +26,7 @@ void main() {
         freq *= lam;
     }
     float c = cos(freq), s = sin(freq);
-    uint base = uint(token) * uint(pc.stride) + uint(head) * uint(pc.head_dim);
+    uint base = uint(token) * uint(pc.stride) + uint(head) * uint(pc.head_dim) + uint(pc.data_off);
     float x1 = data[base + d];
     float x2 = data[base + d + uint(half_dim)];
     data[base + d] = x1*c - x2*s;

@@ -250,7 +250,11 @@ until the entire list below is green.
 ## Speed work (Intel iGPU; qwen2.5-0.5b-q2_k, 20 tok, bench 3)
 - Baseline: 4.96 tok/s decode / 21.2 tok/s prompt.
 - Validation opt-in: 5.8 (+17%). Barrier elision (q/k/v+bias+norm+rope groups): 6.05.
-- Total banked: 4.96 -> 6.05 tok/s (+22%), prompt 21.2 -> 29.7. Golden-locked.
+  - qkv 3->1 dispatch fusion (fused qkv_dev + per-op byte/element offsets through
+    matmul/add_bias/rms_norm/rope/store_kv/paged_attention; K-quant keeps 3
+    dispatches via the VMatrix router): 6.05 -> 6.70 (+11%), prompt 29.7 -> 36.6.
+  - Total banked: 4.96 -> 6.70 tok/s (+35%), prompt 21.2 -> 36.6. Golden-locked
+    (qwen2.5-q2_k 4/4 exercises the K-quant path; Llama-1B f16; smollm q8).
 - Tried and cut: GEMV decode kernels (bit-exact, zero gain — bottleneck is drain
   bubbles, not ALU waste). High-perf power plan: no gain (restored Balanced).
 - Measured anatomy (NANO_TIME): ~130ms fence + ~12ms download per token;

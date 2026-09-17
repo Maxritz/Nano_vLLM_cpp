@@ -53,6 +53,7 @@ struct VBuf {
    void upload_at(VkDeviceSize offset, const void* host, VkDeviceSize bytes);
    void upload_at_async(VkDeviceSize offset, const void* host, VkDeviceSize bytes);
   void download(void* host, VkDeviceSize bytes) const;
+  void download_at(VkDeviceSize offset, void* host, VkDeviceSize bytes) const;
   void free();
   uint32_t words() const; // for fp32 views
 };
@@ -95,19 +96,24 @@ class VulkanBackend {
   // Recorded ops (append to cmd_; each calls dispatch() which barrier's). Buffer
   // sub-ranges (row/col offsets) are passed as byte-element offsets so per-layer KV
   // slices and qkv_row splits work without shader changes (Vulkan descriptor offsets).
-  void matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off = 0, bool barrier_after = true);
-  void matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off = 0, uint32_t ws_off = 0, bool barrier_after = true);
-  void matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off = 0, bool barrier_after = true);
-  void matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off = 0, bool barrier_after = true); // qk/q8/f16 dispatch
-  void rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after = true);
+  // y_range declares the exact output slice; 0 = VK_WHOLE_SIZE. Fused q/k/v
+  // dispatches write disjoint slices of ONE buffer and must declare those slices
+  // (VK_WHOLE_SIZE makes the driver treat the whole buffer as one hazard region,
+  // so the no-barrier dispatches would race — Phi-3 NaN'd without this).
+  void matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off = 0, bool barrier_after = true, VkDeviceSize y_off = 0, VkDeviceSize y_range = 0);
+  void matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off = 0, uint32_t ws_off = 0, bool barrier_after = true, VkDeviceSize y_off = 0, VkDeviceSize y_range = 0);
+  void matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off = 0, bool barrier_after = true, VkDeviceSize y_off = 0, VkDeviceSize y_range = 0);
+  void matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off = 0, bool barrier_after = true, VkDeviceSize y_off = 0, VkDeviceSize y_range = 0); // qk/q8/f16 dispatch
+  void rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after = true, VkDeviceSize xy_off = 0);
   void rms_norm_add(VBuf& x, VBuf& residual, VBuf& w, VBuf& y, int rows, int hidden, float eps);
-  void add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off = 0, bool barrier_after = true);
+  void add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off = 0, bool barrier_after = true, VkDeviceSize x_off = 0);
    void silu_and_mul(VBuf& gup, VBuf& y, int rows, int inter);
    void scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols);
   void rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride,
-          float rope_factor = 1.0f, float rope_beta = 32.0f, bool barrier_after = true);
+          float rope_factor = 1.0f, float rope_beta = 32.0f, bool barrier_after = true, VkDeviceSize data_off = 0);
   void store_kv(VBuf& key, VBuf& value, VBuf& k_cache, VBuf& v_cache, VBuf& slot_map,
-                int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
+                int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0,
+                int key_elem_off = 0, int val_elem_off = 0);
    void paged_attention(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
                         VBuf& block_tables, int tokens, int q_heads, int kv_heads, int head_dim,
                         int block_size, int max_blocks, float scale, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
@@ -116,8 +122,8 @@ class VulkanBackend {
    // (0 = off). paged_attention() above forwards with (0, 0.0f).
    void paged_attention_ex(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
                            VBuf& block_tables, int tokens, int q_heads, int kv_heads, int head_dim,
-                           int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
-                           VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
+int block_size, int max_blocks, float scale, int sw_start, float attn_softcap,
+                            VkDeviceSize k_off = 0, VkDeviceSize v_off = 0, int q_off = 0);
   void embedding(VBuf& ids, VMatrix& w, VBuf& y, int tokens, int hidden);
   void embedding_qk(VBuf& ids, VBuf& wq, VBuf& y, int tokens, int hidden, int kind);
    void gather_rows(VBuf& rows, VBuf& idx, VBuf& y, int cols, int total);

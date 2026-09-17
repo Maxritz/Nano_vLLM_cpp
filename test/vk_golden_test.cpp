@@ -95,12 +95,17 @@ static std::vector<int> greedy_vulkan_ids(const std::string& model_dir, const st
   tok.set_fallback_vocab_size(config.hf.vocab_size);
   tok.load(config.model);
   config.eos = tok.eos_token_id();
+  // GOLDEN_BLOCKS: KV block budget override (default 64; MHA models like Phi-3
+  // need far fewer or the allocation OOMs). Must be set before VulkanModel
+  // copies the config.
+  int max_blocks = getenv("GOLDEN_BLOCKS") ? atoi(getenv("GOLDEN_BLOCKS")) : 64;
+  config.num_kvcache_blocks = max_blocks;
   VulkanModel model(config);
   model.load_weights();
   int num_blocks = model.allocate_kv_cache();
   if (ids.empty()) throw std::runtime_error("empty prompt");
   auto& hf = config.hf;
-  int bsize = config.kvcache_block_size, max_blocks = 64;
+  int bsize = config.kvcache_block_size;
   std::vector<int> out;
   // prefill
   {

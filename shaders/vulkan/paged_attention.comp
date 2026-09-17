@@ -10,7 +10,7 @@
 layout(local_size_x = ATTN_THREADS) in;
 layout(push_constant) uniform PC {
     int tokens, q_heads, kv_heads, head_dim, block_size, max_blocks; float scale;
-    int sw_start; float attn_softcap;
+    int sw_start; float attn_softcap; int q_off;
 } pc;
 layout(std430, binding = 0) buffer BQ { float q[]; };
 layout(std430, binding = 1) buffer BOUT { float g_out[]; };
@@ -32,7 +32,7 @@ void main() {
     int seq = query_seq[int(token)], key_len = query_key_len[int(token)];
     int kv_head = int(head) / (pc.q_heads / pc.kv_heads);
     int q_stride = pc.q_heads * pc.head_dim;
-    for (int d = int(t); d < pc.head_dim; d += ATTN_THREADS) q_sh[d] = q[token*uint(q_stride) + head*uint(pc.head_dim) + uint(d)];
+    for (int d = int(t); d < pc.head_dim; d += ATTN_THREADS) q_sh[d] = q[token*uint(q_stride) + head*uint(pc.head_dim) + uint(d) + uint(pc.q_off)];
     barrier();
     for (int d = int(t); d < ATTN_CHUNK; d += ATTN_THREADS) scores[d] = -1e30f;
     if (key_len <= 0) {

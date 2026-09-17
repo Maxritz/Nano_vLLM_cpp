@@ -3,7 +3,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 layout(local_size_x = 256) in;
-layout(push_constant) uniform PC { int kv_heads; int head_dim; int total; } pc;
+layout(push_constant) uniform PC { int kv_heads; int head_dim; int total; int key_off; int val_off; } pc;
 layout(std430, binding = 0) buffer BKEY { float key[]; };
 layout(std430, binding = 1) buffer BVAL { float value[]; };
 layout(std430, binding = 2) buffer BKCS { float k_cache[]; };
@@ -16,6 +16,6 @@ void main() {
     uint token = idx / uint(d), off = idx % uint(d);
     int slot = slot_map[int(token)];
     if (slot < 0) return;
-    k_cache[uint(slot) * uint(d) + off] = key[idx];
-    v_cache[uint(slot) * uint(d) + off] = value[idx];
+    k_cache[uint(slot) * uint(d) + off] = key[uint(pc.key_off) + idx];
+    v_cache[uint(slot) * uint(d) + off] = value[uint(pc.val_off) + idx];
 }

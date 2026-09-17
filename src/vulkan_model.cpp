@@ -676,26 +676,32 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
     VBuf d_tbl;  if (!ctx.block_tables.empty()) d_tbl = dev_->make(ctx.block_tables);
     VBuf d_last; if (!ctx.last_indices.empty()) d_last = dev_->make(ctx.last_indices);
 
-    VBuf hidden_dev, residual_dev, norm_dev, q_dev, k_dev, v_dev, attn_dev, gate_dev, mlp_dev;
+    VBuf hidden_dev, residual_dev, norm_dev, qkv_dev, attn_dev, gate_dev, mlp_dev;
     const VkDeviceSize F4 = sizeof(float);
     hidden_dev.alloc((VkDeviceSize)rows * hidden * F4);
     residual_dev.alloc((VkDeviceSize)rows * hidden * F4);
     norm_dev.alloc((VkDeviceSize)rows * hidden * F4);
-    q_dev.alloc((VkDeviceSize)rows * q_size_ * F4);
-    k_dev.alloc((VkDeviceSize)rows * kv_size_ * F4);
-    v_dev.alloc((VkDeviceSize)rows * kv_size_ * F4);
+    // Fused q/k/v output buffer: [q rows*q_size | k rows*kv_size | v rows*kv_size].
+    // One contiguous allocation + per-op byte/element offsets replaces three
+    // buffers. Three matmul dispatches write the three slices (w_off selects the
+    // weight slice: one contiguous f16/q8 block, a single fused K-quant weight,
+    // or three K-quant segs). Only the last dispatch carries a barrier; disjoint
+    // declared y_ranges keep the no-barrier dispatches legal on one buffer.
+    // Rope/store/bias/norm take element offsets into the same buffer.
+    qkv_dev.alloc((VkDeviceSize)rows * (q_size_ + 2 * kv_size_) * F4);
     attn_dev.alloc((VkDeviceSize)rows * q_size_ * F4);
     gate_dev.alloc((VkDeviceSize)rows * 2 * std::max(inter, hf.shared_expert_intermediate_size) * F4);
     mlp_dev.alloc((VkDeviceSize)rows * std::max(inter, hf.shared_expert_intermediate_size) * F4);
     { std::vector<float> zeros((size_t)rows * hidden, 0.0f);  // HIP zeroes scratch at alloc; residual is read-before-write
       residual_dev.upload(zeros.data(), (VkDeviceSize)zeros.size() * F4); }
 
+    const VkDeviceSize q_off = 0, k_off = (VkDeviceSize)rows * q_size_ * F4;
     const bool pipe_dbg = std::getenv("NANO_PIPE") != nullptr;
-    auto pipe_tag = [&](const char* stage, const VBuf& b, size_t floats) {
+    auto pipe_tag = [&](const char* stage, const VBuf& b, size_t floats, VkDeviceSize byte_off = 0) {
         if (!pipe_dbg) return;
         dev_->submit_wait();
-        std::vector<float> v(std::min<size_t>(floats, (size_t)rows * hidden));
-        b.download(v.data(), v.size() * F4);
+        std::vector<float> v(std::max<size_t>(floats, 1));
+        b.download_at(byte_off, v.data(), v.size() * F4);
         double sum = 0.0; for (float x : v) sum += x;
         std::fprintf(stderr, "[PIPE vk %s] n=%zu sum=%.6f first=%.6f,%.6f,%.6f\n",
                      stage, v.size(), sum, v[0], v[1], v[2]);
@@ -707,19 +713,35 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.input_ln, norm_dev, rows, hidden, eps);
         // ATTN runs for any resident format (f16/upcast, q8, or native K-quant).
         if (lw.qkv.f16.buffer || lw.qkv.q8.buffer || !lw.qkv.qk_segs.empty()) {
-        // Independent q/k/v groups: skip the barrier on all but the last writer.
-        // The trailing barrier covers the whole group (global write->read).
-        dev_->matmul(norm_dev, lw.qkv, rows, q_size_, hidden, q_dev, 0u, false);
-        dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, k_dev, (uint32_t)(q_size_ * hidden), false);
-        dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, v_dev, (uint32_t)((q_size_ + kv_size_) * hidden));
+        // Fused q/k/v output buffer [q | k | v] in BLOCK layout: q at byte 0, k at
+        // rows*q_size_, v at rows*(q_size_+kv_size_). Three dispatches write the
+        // three slices; only the last carries a barrier. w_off is a weight-element
+        // offset (f16: w_off*2 bytes; q8: byte offset; K-quant: selects seg by
+        // w_off >= seg->elem_off), so q/k/v slice the same fused weight whether it
+        // is one contiguous f16/q8 block or a single fused K-quant weight (Phi-3)
+        // or three K-quant segs. Downstream ops read block layout, which this
+        // unified path always produces (the old single-seg dispatch wrote k/v at
+        // *column* offsets = interleaved, which broke Phi-3).
+        const uint32_t q_wo = 0, k_wo = (uint32_t)(q_size_ * hidden), v_wo = (uint32_t)((q_size_ + kv_size_) * hidden);
+        const VkDeviceSize q_yo = 0, k_yo = (VkDeviceSize)rows * q_size_ * F4, v_yo = (VkDeviceSize)rows * (q_size_ + kv_size_) * F4;
+        // Disjoint declared y_ranges keep the no-barrier dispatches from looking
+        // like one whole-buffer hazard region to the driver (VK_WHOLE_SIZE would).
+        const VkDeviceSize q_yr = (VkDeviceSize)rows * q_size_ * F4, kv_yr = (VkDeviceSize)rows * kv_size_ * F4;
+        dev_->matmul(norm_dev, lw.qkv, rows, q_size_, hidden, qkv_dev, q_wo, false, q_yo, q_yr);
+        dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, qkv_dev, k_wo, false, k_yo, kv_yr);
+        dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, qkv_dev, v_wo, true, v_yo, kv_yr);
         if (lw.qkv_bias.nbytes) {
-            dev_->add_bias_inplace(q_dev, lw.qkv_bias, rows, q_size_, 0u, false);
-            dev_->add_bias_inplace(k_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)q_size_, false);
-            dev_->add_bias_inplace(v_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)(q_size_ + kv_size_));
+            dev_->add_bias_inplace(qkv_dev, lw.qkv_bias, rows, q_size_, 0u, false, q_off);
+            dev_->add_bias_inplace(qkv_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)q_size_, false, k_off);
+            dev_->add_bias_inplace(qkv_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)(q_size_ + kv_size_), true, (VkDeviceSize)rows * (q_size_ + kv_size_) * F4);
         }
-        if (lw.q_norm.nbytes) dev_->rms_norm(q_dev, lw.q_norm, q_dev, rows * heads, head_dim, eps, false);
-        if (lw.k_norm.nbytes) dev_->rms_norm(k_dev, lw.k_norm, k_dev, rows * kv_heads, head_dim, eps);
-        if (layer == 0) { pipe_tag("L0.q", q_dev, (size_t)rows * q_size_); pipe_tag("L0.k", k_dev, (size_t)rows * kv_size_); pipe_tag("L0.v", v_dev, (size_t)rows * kv_size_); }
+        if (lw.q_norm.nbytes) dev_->rms_norm(qkv_dev, lw.q_norm, qkv_dev, rows * heads, head_dim, eps, false, q_off);
+        if (lw.k_norm.nbytes) dev_->rms_norm(qkv_dev, lw.k_norm, qkv_dev, rows * kv_heads, head_dim, eps, true, k_off);
+        if (layer == 0) {
+            pipe_tag("L0.q", qkv_dev, (size_t)rows * q_size_, 0);
+            pipe_tag("L0.k", qkv_dev, (size_t)rows * kv_size_, k_off);
+            pipe_tag("L0.v", qkv_dev, (size_t)rows * kv_size_, (VkDeviceSize)rows * (q_size_ + kv_size_) * F4);
+        }
         // CTX-1: pass YaRN scaling through to the rope shader; factor==1 is a
         // no-op (lambda==1), so unconfigured models are bit-identical.
         const float rf = (float)hf.rope_factor, rb = (float)hf.rope_beta;
@@ -727,12 +749,16 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
             std::fprintf(stderr, "[T] rope L0 factor=%.3f beta=%.1f theta=%.1f\n", rf, rb, hf.rope_theta);
             std::fflush(stderr);
         }
-        dev_->rope(q_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_, rf, rb, false);
-        dev_->rope(k_dev, d_pos, inv_freq_, rows, kv_heads, head_dim, kv_size_, rf, rb);
-        if (layer == 0) { pipe_tag("L0.qrope", q_dev, (size_t)rows * q_size_); pipe_tag("L0.krope", k_dev, (size_t)rows * kv_size_); }
+        dev_->rope(qkv_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_, rf, rb, false, 0);
+        dev_->rope(qkv_dev, d_pos, inv_freq_, rows, kv_heads, head_dim, kv_size_, rf, rb, true, (VkDeviceSize)rows * q_size_);
+        if (layer == 0) {
+            pipe_tag("L0.qrope", qkv_dev, (size_t)rows * q_size_, 0);
+            pipe_tag("L0.krope", qkv_dev, (size_t)rows * kv_size_, k_off);
+        }
         int d = kv_heads * head_dim;
         if (d_slot.buffer && !ctx.slot_mapping.empty())
-            dev_->store_kv(k_dev, v_dev, k_cache_[layer], v_cache_[layer], d_slot, kv_heads, head_dim, rows * d, 0u, 0u);
+            dev_->store_kv(qkv_dev, qkv_dev, k_cache_[layer], v_cache_[layer], d_slot, kv_heads, head_dim, rows * d, 0u, 0u,
+                           rows * q_size_, rows * (q_size_ + kv_size_));
         if (d_qseq.buffer && !ctx.query_seq.empty()) {
             // ATTN-1: single sw_start per dispatch from the longest sequence
             // (exact for the usual single-request case); per-layer pattern flag.
@@ -748,9 +774,9 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
                     std::fprintf(stderr, "[T] attn sw_start=%d window=%d maxlen=%d\n",
                                  sw_start, hf.sliding_window, maxlen);
             }
-            dev_->paged_attention_ex(q_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
+            dev_->paged_attention_ex(qkv_dev, attn_dev, k_cache_[layer], v_cache_[layer], d_qseq, d_qlen, d_tbl,
                                      rows, heads, kv_heads, head_dim, block_size_, ctx.max_blocks, scale,
-                                     sw_start, (float)hf.attn_logit_softcapping, 0u, 0u);
+                                     sw_start, (float)hf.attn_logit_softcapping, 0u, 0u, 0);
         }
         if (layer == 0) pipe_tag("L0.attn", attn_dev, (size_t)rows * q_size_);
         dev_->matmul(attn_dev, lw.o, rows, hidden, q_size_, hidden_dev);
