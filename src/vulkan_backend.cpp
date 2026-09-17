@@ -450,9 +450,9 @@ std::unique_ptr<VulkanBackend> VulkanBackend::Create(bool force_device_local) {
 
     VkInstanceCreateInfo ic{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ic.pApplicationInfo = &ai;
-    // Best-effort validation layer: enable only if present and not suppressed.
+    // Validation layer: opt-in via VK_VALIDATION=1 (it costs ~15% throughput).
     const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
-    if (!std::getenv("VK_NO_VALIDATION")) {
+    if (std::getenv("VK_VALIDATION")) {
         uint32_t nLayers = 0;
         vkEnumerateInstanceLayerProperties(&nLayers, nullptr);
         std::vector<VkLayerProperties> avail(nLayers);
