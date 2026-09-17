@@ -281,7 +281,8 @@ static bool q8_to_u16(const std::vector<uint8_t>& q8, std::vector<uint16_t>& u) 
 void VulkanModel::load_matrix(const std::string& name, VMatrix& m, bool required, size_t n_elements) {
     std::vector<uint8_t> q8;
     if (load_q8(name, q8)) { upload_q8_block(q8, m); m.f16.free(); m.qk.free(); m.qk_segs.clear(); return; }
-    for (int kind : {12, 13, 14}) {
+    for (int kind : {10, 12, 13, 14}) {
+        if (kind == 10 && std::getenv("NANO_F16Q2")) continue;  // DBG tag: force Q2_K via F16 upcast
         if (kind == 14 && std::getenv("NANO_F16Q6")) continue;  // DBG tag: force Q6_K via F16 upcast
         std::vector<uint8_t> qk;
          if (load_qk(name, kind, n_elements, qk)) { upload_qk_block(qk, kind, m); return; }
@@ -295,7 +296,7 @@ void VulkanModel::load_matrix_host(const std::string& n, std::vector<uint16_t>& 
                                    int& qk_kind, size_t n_elements, bool required) {
     u16.clear(); q8.clear(); qk.clear(); bf16 = false; is_q8 = false; qk_kind = 0;
     if (load_q8(n, q8)) { is_q8 = true; return; }
-    for (int kind : {12, 13, 14}) {
+    for (int kind : {10, 12, 13, 14}) {
          if (load_qk(n, kind, n_elements, qk)) { qk_kind = kind; return; }
     }
     if (load_u16(n, u16, bf16)) { is_q8 = false; return; }

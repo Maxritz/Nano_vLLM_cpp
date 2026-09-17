@@ -363,6 +363,7 @@ bool GGUFLoader::load_q8_0(const std::string& name, std::vector<uint8_t>& out) c
 
 size_t GGUFLoader::qk_block_bytes(int ggml_type) {
   switch (ggml_type) {
+    case 10: return 84;   // Q2_K
     case 12: return 144;  // Q4_K
     case 13: return 176;  // Q5_K
     case 14: return 210;  // Q6_K

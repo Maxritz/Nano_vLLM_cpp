@@ -603,7 +603,7 @@ void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, ui
         const QKSeg* seg = &w.qk_segs[0];
         for (auto& s : w.qk_segs)
             if (w_off >= (uint32_t)s.elem_off) seg = &s;
-        size_t bb = seg->kind == 12 ? 144 : (seg->kind == 13 ? 176 : 210);
+        size_t bb = seg->kind == 10 ? 84 : (seg->kind == 12 ? 144 : (seg->kind == 13 ? 176 : 210));
         if (!bb || (w_off - (uint32_t)seg->elem_off) % 256) {
             std::fprintf(stderr, "VK: K-quant row split off super-block boundary\n"); std::exit(1);
         }

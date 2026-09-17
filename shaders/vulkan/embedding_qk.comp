@@ -1,5 +1,5 @@
 // Embedding gather over raw K-quant super-blocks (QK_K=256).
-// kind: 12=Q4_K (144B/blk), 13=Q5_K (176B/blk), 14=Q6_K (210B/blk).
+// kind: 10=Q2_K (84B/blk), 12=Q4_K (144B/blk), 13=Q5_K (176B/blk), 14=Q6_K (210B/blk).
 #version 450
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -23,6 +23,17 @@ uint fp16_to_float_u(uint h) {
     else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
     else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
     return bits;
+}
+float qk_q2(uint base, uint i) {
+    uint g = i >> 4, j = i & 15u;
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 80u]) | (uint(wq[base + 81u]) << 8)));
+    float dmin = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 82u]) | (uint(wq[base + 83u]) << 8)));
+    uint sb = wq[base + g];
+    float dl = d * float(sb & 0xFu);
+    float ml = dmin * float(sb >> 4);
+    uint byte = (g >> 3) * 32u + (g & 1u) * 16u + j;
+    uint q = (wq[base + 16u + byte] >> (((g >> 1) & 3u) * 2u)) & 3u;
+    return dl * float(q) - ml;
 }
 float qk_q4(uint base, uint i) {
     uint dh = uint(wq[base]) | (uint(wq[base + 1u]) << 8);
@@ -75,7 +86,7 @@ void main() {
     if (idx >= uint(pc.total)) return;
     uint token = idx / uint(pc.hidden), col = idx % uint(pc.hidden);
     uint e = uint(ids[token]) * uint(pc.hidden) + col;
-    uint bb = pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u);
+    uint bb = pc.kind == 10 ? 84u : (pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u));
     uint b = e >> 8, i = e & 255u;
-    y[idx] = (pc.kind == 12) ? qk_q4(b*bb, i) : (pc.kind == 13 ? qk_q5(b*bb, i) : qk_q6(b*bb, i));
+    y[idx] = (pc.kind == 10) ? qk_q2(b*bb, i) : ((pc.kind == 12) ? qk_q4(b*bb, i) : (pc.kind == 13 ? qk_q5(b*bb, i) : qk_q6(b*bb, i)));
 }

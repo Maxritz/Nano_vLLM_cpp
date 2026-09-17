@@ -1,5 +1,7 @@
 // TILE=16 twin of matmul_q8 over raw K-quant super-blocks (QK_K=256).
-// kind: 12=Q4_K (144B/blk), 13=Q5_K (176B/blk), 14=Q6_K (210B/blk). Zero VRAM bloat: dequant inline.
+// kind: 10=Q2_K (84B/blk), 12=Q4_K (144B/blk), 13=Q5_K (176B/blk), 14=Q6_K (210B/blk).
+// Zero VRAM bloat: dequant inline. Q2_K mirrors host dequant_q2_k_block exactly:
+// [16B scales][64B qs][fp16 d][fp16 dmin]; y = d*(sc&15)*q - dmin*(sc>>4).
 #version 450
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -26,6 +28,17 @@ uint fp16_to_float_u(uint h) {
     else if (exp == 0x1fu) { bits = sign | 0x7f800000u | (mant << 13); }
     else { bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13); }
     return bits;
+}
+float qk_q2(uint base, uint i) {
+    uint g = i >> 4, j = i & 15u;
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 80u]) | (uint(wq[base + 81u]) << 8)));
+    float dmin = uintBitsToFloat(fp16_to_float_u(uint(wq[base + 82u]) | (uint(wq[base + 83u]) << 8)));
+    uint sb = wq[base + g];
+    float dl = d * float(sb & 0xFu);
+    float ml = dmin * float(sb >> 4);
+    uint byte = (g >> 3) * 32u + (g & 1u) * 16u + j;
+    uint q = (wq[base + 16u + byte] >> (((g >> 1) & 3u) * 2u)) & 3u;
+    return dl * float(q) - ml;
 }
 float qk_q4(uint base, uint i) {
     uint dh = uint(wq[base]) | (uint(wq[base + 1u]) << 8);
@@ -77,7 +90,7 @@ float qk_q6(uint base, uint i) {
 void main() {
     uint tx = gl_LocalInvocationIndex & 15u, ty = gl_LocalInvocationIndex >> 4;
     uint row = gl_WorkGroupID.y * 16 + ty, col = gl_WorkGroupID.x * 16 + tx;
-    uint bb = pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u);
+    uint bb = pc.kind == 10 ? 84u : (pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u));
     float acc = 0.0;
     for (int kt = 0; kt < (pc.k + 15)/16; ++kt) {
         uint ak = uint(kt)*16 + tx, row_abs = gl_WorkGroupID.y*16 + ty;
@@ -86,7 +99,7 @@ void main() {
         float wv = 0.0;
         if (br < uint(pc.n) && bk < uint(pc.k)) {
             uint b = idx >> 8, i = idx & 255u;
-             wv = (pc.kind == 12) ? qk_q4(b*bb + pc.woff, i) : (pc.kind == 13 ? qk_q5(b*bb + pc.woff, i) : qk_q6(b*bb + pc.woff, i));
+             wv = (pc.kind == 10) ? qk_q2(b*bb + pc.woff, i) : ((pc.kind == 12) ? qk_q4(b*bb + pc.woff, i) : (pc.kind == 13 ? qk_q5(b*bb + pc.woff, i) : qk_q6(b*bb + pc.woff, i)));
          }
          Bs[ty][tx] = wv;
          barrier();
