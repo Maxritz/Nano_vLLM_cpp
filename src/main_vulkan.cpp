@@ -6,6 +6,7 @@
 #include "nanovllm/reason.hpp"
 #include "nanovllm/gen.hpp"
 #include "nanovllm/drafter.hpp"
+#include "nanovllm/sampler.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -43,54 +44,7 @@ static void usage(const char* prog) {
   std::fprintf(stderr, "  --repl: interactive chat loop reading stdin line by line (EOF to exit).\n");
 }
 
-// CPU sampler: greedy at temp<=0, else temperature + nucleus sampling.
-// SAMP-1: recent_ids/recent_len carry generated-token history (main's `out`);
-// ids seen in the last rep_window entries have their scores divided by
-// rep_penalty (applied pre-nucleus, i.e. penalized ids can drop out of top-p).
-// rep_penalty == 1.0 (default) skips this entirely: behavior is bit-identical.
-static int sample_row(const float* logits, int vocab, double temp, double top_p, std::mt19937& rng,
-                      const int* recent_ids = nullptr, size_t recent_len = 0, double rep_penalty = 1.0,
-                      int rep_window = 64) {
-  if (temp <= 0) return (int)(std::max_element(logits, logits + vocab) - logits);
-  std::vector<int> idx((size_t)vocab);
-  for (int i = 0; i < vocab; ++i) idx[(size_t)i] = i;
-  std::vector<float> sc((size_t)vocab);
-  float mx = -1e30f;
-  for (int i = 0; i < vocab; ++i) mx = std::max(mx, logits[i]);
-  double sum = 0;
-  for (int i = 0; i < vocab; ++i) { sc[(size_t)i] = std::exp((logits[i] - mx) / temp); sum += sc[(size_t)i]; }
-  if (rep_penalty != 1.0 && rep_penalty > 0.0 && recent_ids != nullptr && recent_len > 0) {
-    size_t w = rep_window > 0 ? std::min<size_t>((size_t)rep_window, recent_len) : recent_len;
-    std::vector<int> seen;
-    seen.reserve(w);
-    bool changed = false;
-    for (size_t k = recent_len - w; k < recent_len; ++k) {
-      int id = recent_ids[k];
-      if (id < 0 || id >= vocab) continue;
-      if (std::find(seen.begin(), seen.end(), id) != seen.end()) continue;
-      seen.push_back(id);
-      sc[(size_t)id] /= (float)rep_penalty;
-      changed = true;
-    }
-    if (changed) {
-      sum = 0;
-      for (int i = 0; i < vocab; ++i) sum += sc[(size_t)i];
-    }
-  }
-  std::sort(idx.begin(), idx.end(), [&](int a, int b) { return sc[(size_t)a] > sc[(size_t)b]; });
-  double acc = 0, cutoff = 0;
-  size_t keep = idx.size();
-  for (size_t i = 0; i < idx.size(); ++i) {
-    acc += sc[(size_t)idx[i]] / sum;
-    if (acc >= top_p && i > 0) { keep = i + 1; break; }
-  }
-  double r = std::uniform_real_distribution<double>(0, 1)(rng) * acc, run = 0;
-  for (size_t i = 0; i < keep; ++i) {
-    run += sc[(size_t)idx[i]] / sum;
-    if (r <= run) return idx[i];
-  }
-  return idx[keep - 1];
-}
+// SAMP-1: sample_row lives in nanovllm/sampler.hpp (with SAMP_TEST asserts).
 
 // REPL-1: one generation turn over the shared KV cache. `out` is the running
 // generated-token history (across turns) so the model keeps conversational

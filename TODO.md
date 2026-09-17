@@ -33,6 +33,12 @@
       decode step; flag absent -> zero sw traces, bit-identical output.)
 - [x] PLUG-2 --ctx-window: delivered via ATTN-1 override above. --kv-policy
       stays parked: no policy DLL exists (load() always falls back to builtin).
+- [x] SAMP-1: sample_row moved verbatim into nanovllm/sampler.hpp (was a static
+      copy in main_vulkan.cpp) + SAMP_TEST 7/7 asserts (greedy, skip-path
+      stability, window slicing, window=0, OOB skip, nullptr, golden pair).
+      Verified: samp_test passes with asserts LIVE (/U NDEBUG — Release
+      defines NDEBUG, which otherwise makes every *_TEST vacuous); binary
+      output bit-identical across runs after the move.
 
 ## PENDING — engine work (13 items, not started)
 - [ ] SERV-2: embeddings endpoint + concurrent request batching (http_server.hpp + main_vulkan)
@@ -46,7 +52,6 @@
 - [ ] HIP re-mirror: SIDELINED — full Vulkan is the goal; HIP/ROCm dormant until HW is available
 - [ ] 8GB-MoE (2/3): GGUF MoE naming (blk.N.ffn_*_exps) + lift gguf-only throw
 - [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place, bit-golden vs gguf-py
-- [ ] SAMP-1: verify sample_row's windowed rep_penalty vs spec
 
 ## PENDING — headers built, wiring into the binary needed
 (already-wired items moved to DONE above: RAG-1, MCP-1, DEC-2, REAS-1, GEN-1,
@@ -60,10 +65,9 @@ PROF-1, CTX-1 --rope-scale. ADAPT-1/lora dropped per user: YAGNI, no adapter.)
       so a radix prefix cache adds zero in single-session; real value is
       cross-request in --server (which resets KV per request today).
       Add with SERV-2 batching.
-- [ ] PLUG-2 wiring: build the streaming DLL + --kv-policy/--ctx-window switches.
-      SKIPPED for now: no DLL exists (load() always falls back to builtin) and
-      a windowed key_len without shader sw_start support (ATTN-1 gap:
-      vulkan_model passes 0,0) would silently mis-attend. Wire with ATTN-1.
+- [ ] PLUG-2 wiring: build the streaming DLL + --kv-policy switch.
+      (--ctx-window DONE via ATTN-1. No DLL exists so load() always falls back
+      to builtin; the switch would be theater until a DLL does.)
 
 
 Every backlog item keeps its own line with its own status. Debug probes
@@ -82,8 +86,7 @@ until the entire list below is green.
       bos_token_id=1 but never prepends; GGUF omits add_bos_token => llama-arch
       default must be TRUE. Probe: ref+BOS flips top1 8111(vector)->22168.
       Fix: store add_bos_/bos_id_, prepend in encode_text. Test: tok_probe ids[0]==1.
-- [ ] HIP re-mirror: src/model.cpp agent edits (mixed-fuse) unverified, no toolchain
-      here; re-sync after BOS fix lands.
+- [ ] HIP re-mirror: SIDELINED with the rest of HIP/ROCm until HW is available.
 
 ## 8GB-MoE
 - [x] 8GB-MoE (1/3): synthesize tiny Q4_K GGUF MoE locally as test artifact

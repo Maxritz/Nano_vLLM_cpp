@@ -129,6 +129,12 @@ target_compile_options(lora_test PRIVATE
 add_executable(drafter_test test/drafter_test.cpp)
 add_executable(rag_test test/rag_test.cpp)
 target_include_directories(rag_test PRIVATE include)
+add_executable(samp_test test/samp_test.cpp)
+target_include_directories(samp_test PRIVATE include)
+# Self-tests assert(): keep them live in Release (which defines NDEBUG).
+target_compile_options(samp_test PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/U"NDEBUG">
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
 target_include_directories(drafter_test PRIVATE include)
 add_executable(cache_test test/cache_test.cpp)
 target_include_directories(cache_test PRIVATE include)
