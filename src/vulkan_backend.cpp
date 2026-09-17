@@ -692,10 +692,14 @@ void VulkanBackend::matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, 
                         {2, ws.buffer, (VkDeviceSize)ws_off * 2, 0}, {3, y.buffer, y_off, y_range} };
     // Decode (m small): GEMV streams int8 loads per column; prefill keeps the
     // 16x16 tile.
-    const bool gemv = m <= 4 && (size_t)k * n >= 256u;
+    const bool gemv = m <= 4 && ru(n,16)/16 >= 128;
     const char* name = gemv ? "matmul_q8_gemv" : "matmul_q8";
-    if (barrier_after) dispatch(name, &pc, sizeof(pc), bufs, 4, ru(n,16)/16, gemv ? (unsigned)m : ru(m,16)/16, 1);
-    else dispatch_nb(name, &pc, sizeof(pc), bufs, 4, ru(n,16)/16, gemv ? (unsigned)m : ru(m,16)/16, 1);
+    // The tiled GEMV assigns ONE output column per workgroup (cooperative
+    // 16-lane reads of a 32-byte Q8_0 block), so its grid is n workgroups, not
+    // the 16-columns-per-WG grid the shared 16x16 kernel uses.
+    const uint32_t gx = gemv ? (uint32_t)n : ru(n,16)/16;
+    if (barrier_after) dispatch(name, &pc, sizeof(pc), bufs, 4, gx, gemv ? (unsigned)m : ru(m,16)/16, 1);
+    else dispatch_nb(name, &pc, sizeof(pc), bufs, 4, gx, gemv ? (unsigned)m : ru(m,16)/16, 1);
 }
 void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off, bool barrier_after, VkDeviceSize y_off, VkDeviceSize y_range) {
     if (!w.qk_segs.empty()) {

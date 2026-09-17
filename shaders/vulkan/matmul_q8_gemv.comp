@@ -1,22 +1,36 @@
-// Decode GEMV for Q8_0 weights (M small). Same M=1 pathology as the K-quant
-// GEMV: matmul_q8's 16x16 tile reads w8[col*k+bk] one lane per column, so
-// adjacent lanes are k bytes apart -> ~1 useful byte per 64B cache line (the
-// measured ceiling is ~25 GB/s; the tile realises ~3). Here 4 lanes per output
-// column walk a contiguous quarter of that column's Q8_0 row: int8 loads are
-// sequential, and the fp16 row-scale broadcasts once per 32 values.
+// Decode GEMV for Q8_0, structured like llama.cpp's mul_mat_vec_q2_k and
+// ThunderKittens-style cooperative tiling.
 //
-// Q8_0 layout: [fp16 d][32 x int8 q] per 32 values (34 bytes, padded to 36 in
-// some builds; we index by the block base so either works).
+// The flaw in the per-column GEMV: 16 output columns each stream their own
+// weight column independently, so the workgroup's instantaneous reads are
+// 896 bytes apart -> scattered, one cache line per column, mostly wasted.
+//
+// This kernel instead assigns ONE output column per workgroup and tiles the
+// K dimension cooperatively: 16 threads read 16 consecutive uint16s (32 bytes
+// = one whole Q8_0 block) in a single coalesced burst, and 16 blocks are in
+// flight at once (256 threads = 16 threads/block x 16 blocks), which keeps
+// ~256 loads outstanding to hide DRAM latency. Accumulators stay in registers
+// for the whole K walk; shared memory is touched once, by the final reduce.
+//
+// Layout (upload_q8_block): w8 = n*k int8 (scale header stripped, 32 values
+// per block), ws = one fp16 scale per block. Weight is [n][k]: column c owns
+// blocks [c*nb, (c+1)*nb), nb = K/32.
+//
+// Sign handling: Q8 values are int8; for unsigned byte u, q = u - 256*[u>=128],
+// so sum(x*q) = sum(x*u) - 256*sum_{u>=128}(x). Avoids the expensive
+// int8 sign-extend on the critical path.
 #version 450
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
-layout(local_size_x = 16, local_size_y = 4) in;   // 16 cols x 4 K-lanes
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;   // 16 threads/block x 16 blocks in flight
 layout(push_constant) uniform PC { int m, n, k; uint w_off; uint ws_off; } pc;
-layout(std430, binding = 0) buffer BX { float x[]; };
-layout(std430, binding = 1) buffer BW8  { uint8_t  w8[]; };
-layout(std430, binding = 2) buffer BWS16 { uint16_t ws[]; };
-layout(std430, binding = 3) buffer BY { float y[]; };
-shared float red[16][4];
+layout(std430, binding = 0) buffer BX  { float x[]; };
+layout(std430, binding = 1) buffer BW  { uint16_t w16[]; };
+layout(std430, binding = 2) buffer BWS { uint16_t ws[]; };
+layout(std430, binding = 3) buffer BY  { float y[]; };
+shared float partial[16];   // one per subgroup after subgroupAdd
 
 uint fp16_to_float_u(uint h) {
     uint sign = (h & 0x8000u) << 16;
@@ -36,36 +50,48 @@ uint fp16_to_float_u(uint h) {
 }
 
 void main() {
-    uint tx = gl_LocalInvocationID.x;          // column within the 16-col group
-    uint ty = gl_LocalInvocationID.y;          // K-lane within the 4-way split
-    uint col = gl_WorkGroupID.x * 16u + tx;    // output column
-    uint row = gl_WorkGroupID.y;               // input row (M batch)
-    if (col >= uint(pc.n)) { red[tx][ty] = 0.0; return; }
-    // Each of the 4 K-lanes owns a contiguous quarter of the row.
-    uint kper = (uint(pc.k) + 3u) / 4u;
-    uint k0 = ty * kper, k1 = min(k0 + kper, uint(pc.k));
+    uint col = gl_WorkGroupID.x;            // one output column per workgroup
+    uint row = gl_WorkGroupID.y;            // input row (M batch)
+    uint tid = gl_LocalInvocationID.x;
+    uint itid = tid & 15u;                  // 0..15, index within the block
+    uint ix   = tid >> 4;                   // 0..15, block-in-flight index
+    if (col >= uint(pc.n)) return;
+
+    uint K  = uint(pc.k);
+    uint nb = K / 32u;                      // Q8_0 blocks per column (K%32==0)
+    uint xbase = row * K;
+
     float acc = 0.0;
-    // Weight is [n][k] row-major with the scale header stripped: column `col`
-    // owns elements [col*k, (col+1)*k), laid out as col*k/32 Q8_0 blocks. Each
-    // of the 4 K-lanes walks a contiguous quarter of that column's blocks, so
-    // int8 loads stream sequentially within a lane.
-    uint nb_total = (uint(pc.k) + 31u) / 32u;
-    uint b0 = col * nb_total + k0 / 32u;
-    uint b1 = col * nb_total + (k1 + 31u) / 32u;
-    for (uint b = b0; b < b1; ++b) {
-        float d = uintBitsToFloat(fp16_to_float_u(ws[pc.ws_off + b]));
-        uint qbase = pc.w_off + b * 32u;
-        uint ki_base = (b - col * nb_total) * 32u;
-        uint i0 = (b == b0) ? (k0 - ki_base) : 0u;
-        uint i1 = (b + 1u == b1) ? min(k1 - ki_base, 32u) : 32u;
-        for (uint i = i0; i < i1; ++i) {
-            float q = float(int8_t(w8[qbase + i]));
-            acc += x[row*uint(pc.k) + ki_base + i] * (d * q);
+    // Blocks advance in strides of 16 (it_size); thread group ix owns every
+    // 16th block, and the 16 itid lanes of one block read consecutive bytes.
+    // NO early break: lanes must stay converged so the coalesced loads and the
+    // subgroupAdd below see identical control flow (divergence silently
+    // corrupts both the memory pattern and the reduction).
+    for (uint b0 = 0u; b0 < nb; b0 += 16u) {
+        uint b = b0 + ix;
+        if (b < nb) {
+            float d = uintBitsToFloat(fp16_to_float_u(ws[pc.ws_off + col * nb + b]));
+            // Coalesced: lanes 0..15 hit w16[..], w16[..+1], ... = 32 bytes.
+            uint16_t q16 = w16[(col * K + b * 32u) / 2u + itid];
+            float u0 = float(q16 & 0xFFu);
+            float u1 = float(q16 >> 8);
+            float x0 = x[xbase + b * 32u + itid * 2u];
+            float x1 = x[xbase + b * 32u + itid * 2u + 1u];
+            // q = u - 256*[u>=128]
+            acc = fma(x0, d * (u0 - (u0 >= 128.0 ? 256.0 : 0.0)), acc);
+            acc = fma(x1, d * (u1 - (u1 >= 128.0 ? 256.0 : 0.0)), acc);
         }
     }
-    red[tx][ty] = acc;
+
+    // Reduce: subgroupAdd collapses each 16-lane block group, then the 16
+    // subgroup leaders sum through shared memory. partial[] is zero for
+    // tid>=16 (never written), so every lane can read safely.
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = acc;
     barrier();
-    if (ty == 0u) {
-        y[row*uint(pc.n) + col] = red[tx][0] + red[tx][1] + red[tx][2] + red[tx][3];
+    if (tid == 0u) {
+        float sum = partial[0];
+        [[unroll]] for (uint s = 1u; s < 16u; ++s) sum += partial[s];
+        y[row * uint(pc.n) + col] = sum;
     }
 }
