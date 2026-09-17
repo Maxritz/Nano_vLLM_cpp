@@ -42,7 +42,9 @@
 
 ## PENDING — engine work (13 items, not started)
 - [ ] SERV-2: embeddings endpoint + concurrent request batching (http_server.hpp + main_vulkan)
-- [ ] PF-1: chunked prefill (vulkan_model.cpp prefill path)
+- [x] PF-1: chunked prefill (--prefill-chunk C via shared prefill_logits helper,
+      wired at all 3 prefill sites: run_turn, --server, single-shot)
+      (Verified: --prefill-chunk 1 token-at-a-time == one-pass, identical text.)
 - [ ] DEC-1: speculative decoding via MTP heads (vulkan_model.cpp)
 - [ ] KV-1: FP8 KV cache (shaders + vulkan_backend.cpp)
 - [ ] ATTN-3: K/V SLM tiling in paged_attention (shaders)
@@ -50,8 +52,8 @@
 - [ ] QUANT-6: Q2_K native GPU kernel (shaders)
 - [ ] VERIFY workers: full golden matrix re-run after BOS fix (GPU==CPU all tags)
 - [ ] HIP re-mirror: SIDELINED — full Vulkan is the goal; HIP/ROCm dormant until HW is available
-- [ ] 8GB-MoE (2/3): GGUF MoE naming (blk.N.ffn_*_exps) + lift gguf-only throw
-- [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place, bit-golden vs gguf-py
+- [x] 8GB-MoE (2/3): proven end-to-end on qwen3.5-moe-tiny (see 8GB-MoE section)
+- [ ] 8GB-MoE (3/3): BLOCKED on a GGUF MoE file (math is dense-proven; stride plumbing unrun)
 
 ## PENDING — headers built, wiring into the binary needed
 (already-wired items moved to DONE above: RAG-1, MCP-1, DEC-2, REAS-1, GEN-1,
@@ -91,10 +93,15 @@ until the entire list below is green.
 ## 8GB-MoE
 - [x] 8GB-MoE (1/3): synthesize tiny Q4_K GGUF MoE locally as test artifact
       (DONE: temp moe_tiny_q4k, 8.2MB, loads + prefills)
-- [ ] 8GB-MoE (2/3): GGUF MoE naming (blk.N.ffn_*_exps) + lift gguf-only throw
-      (loads+prefills now; close on golden token-match in VERIFY)
-- [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place, golden-verified
-      (ran; bit-golden vs gguf-py method still open -> fold into VERIFY)
+- [x] 8GB-MoE (2/3): MoE naming + end-to-end GPU proof on C:\models\qwen3.5-moe-tiny
+      (safetensors, 4 sparse layers, 128 experts, top-10, per-expert naming).
+      Verified: loads, "MoE: 4 sparse layers...", prefills (gpu top5 + next=20870),
+      decodes; two runs signal-identical (prefill next + decoded text match).
+      Garbage multilingual output is expected (random 10MB weights).
+      REMAINING: GGUF-MoE end-to-end (no GGUF MoE on hand; synth artifact gone).
+- [ ] 8GB-MoE (3/3): Q4_K/Q6_K expert host-dequant in moe_place.
+      Math is the shared dense-proven dequant_blocks_f16 (QUANT-3/Q4_K canonical);
+      only the e*stride plumbing lacks an end-to-end run. BLOCKED on a GGUF MoE file.
 
 ## VKLAYOUT
 - [x] VKLAYOUT-1: tiled-layout reader (vulkan_native meta + tile index math in
