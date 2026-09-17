@@ -1,5 +1,6 @@
 // Embedding gather over raw K-quant super-blocks (QK_K=256).
-// kind: 10=Q2_K (84B/blk), 12=Q4_K (144B/blk), 13=Q5_K (176B/blk), 14=Q6_K (210B/blk).
+// kind: 2=Q4_0 (18B/blk, 32 vals), 10=Q2_K (84B/blk), 12=Q4_K (144B/blk),
+// 13=Q5_K (176B/blk), 14=Q6_K (210B/blk).
 #version 450
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -35,6 +36,11 @@ float qk_q2(uint base, uint i) {
     uint q = (wq[base + 16u + byte] >> (((g >> 1) & 3u) * 2u)) & 3u;
     return dl * float(q) - ml;
 }
+float qk_q4_0(uint base, uint i) {
+    float d = uintBitsToFloat(fp16_to_float_u(uint(wq[base]) | (uint(wq[base + 1u]) << 8)));
+    uint nib = i < 16u ? (wq[base + 2u + i] & 0xFu) : (wq[base + 2u + i - 16u] >> 4);
+    return d * (float(nib) - 8.0);
+}
 float qk_q4(uint base, uint i) {
     uint dh = uint(wq[base]) | (uint(wq[base + 1u]) << 8);
     uint dmh = uint(wq[base + 2u]) | (uint(wq[base + 3u]) << 8);
@@ -45,8 +51,8 @@ float qk_q4(uint base, uint i) {
     uint sc, mn;
     if (j < 4u) { sc = wq[b4 + j] & 63u; mn = wq[b4 + j + 4u] & 63u; }
     else { sc = (wq[b4 + j + 4u] & 0xFu) | ((wq[b4 + j - 4u] >> 6) << 4); mn = (wq[b4 + j + 4u] >> 4) | ((wq[b4 + j] >> 6) << 4); }
-    uint qb = wq[base + 16u + j * 16u + (e & 15u)];
-    uint q = (e < 16u) ? (qb & 0xFu) : (qb >> 4);
+    uint qb = wq[base + 16u + (j >> 1) * 32u + e];
+    uint q = (qb >> ((j & 1u) * 4u)) & 0xFu;
     return d * float(sc) * float(q) - dmin * float(mn);
 }
 float qk_q5(uint base, uint i) {
@@ -86,7 +92,7 @@ void main() {
     if (idx >= uint(pc.total)) return;
     uint token = idx / uint(pc.hidden), col = idx % uint(pc.hidden);
     uint e = uint(ids[token]) * uint(pc.hidden) + col;
-    uint bb = pc.kind == 10 ? 84u : (pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u));
-    uint b = e >> 8, i = e & 255u;
-    y[idx] = (pc.kind == 10) ? qk_q2(b*bb, i) : ((pc.kind == 12) ? qk_q4(b*bb, i) : (pc.kind == 13 ? qk_q5(b*bb, i) : qk_q6(b*bb, i)));
+    uint bb = pc.kind == 2 ? 18u : (pc.kind == 10 ? 84u : (pc.kind == 12 ? 144u : (pc.kind == 13 ? 176u : 210u)));
+    uint b = pc.kind == 2 ? e >> 5 : e >> 8, i = pc.kind == 2 ? e & 31u : e & 255u;
+    y[idx] = (pc.kind == 2) ? qk_q4_0(b*bb, i) : ((pc.kind == 10) ? qk_q2(b*bb, i) : ((pc.kind == 12) ? qk_q4(b*bb, i) : (pc.kind == 13 ? qk_q5(b*bb, i) : qk_q6(b*bb, i))));
 }

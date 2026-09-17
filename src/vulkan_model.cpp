@@ -169,6 +169,7 @@ std::string VulkanModel::map_name(const std::string& n) {
     rep(".mlp.shared_expert.down_proj.weight", ".ffn_down_shexp.weight");
     rep(".mlp.shared_expert_gate.weight", ".ffn_shexp_gate.weight");
     rep("model.embed_tokens.weight", "token_embd.weight");
+    rep(".self_attn.qkv_proj.weight", ".attn_qkv.weight");
     rep(".self_attn.q_proj.weight", ".attn_q.weight");
     rep(".self_attn.k_proj.weight", ".attn_k.weight");
     rep(".self_attn.v_proj.weight", ".attn_v.weight");
@@ -204,6 +205,14 @@ void VulkanModel::load_model_dir(const std::string& model_dir) {
     st_loader_.add_directory(model_dir); st_ = true; gguf_ = false;
 }
 bool VulkanModel::contains(const std::string& n) const { return st_ ? st_loader_.contains(n) : gg_loader_.contains(map_name(n)); }
+size_t VulkanModel::fused_up_elems(const std::string& p, int inter, int hidden) const {
+    if (!gguf_ || inter <= 0 || hidden <= 0) return 0;
+    const GGUFTensorMeta* tm = gg_loader_.tensor(map_name(p + ".mlp.up_proj.weight"));
+    if (!tm) return 0;
+    size_t n = 1;
+    for (int64_t d : tm->shape) n *= (size_t)d;
+    return n;
+}
 
 std::string VulkanModel::moe_key_prefix(int layer) const {
     // Resolve the MLP key prefix for this layer. Handles:
@@ -285,14 +294,15 @@ void VulkanModel::load_matrix(const std::string& name, VMatrix& m, bool required
             std::fprintf(stderr, "[T] load %s via %s\n", map_name(name).c_str(), via);
     };
     if (load_q8(name, q8)) { upload_q8_block(q8, m); m.f16.free(); m.qk.free(); m.qk_segs.clear(); lt("q8"); return; }
-    for (int kind : {10, 12, 13, 14}) {
+    for (int kind : {2, 10, 12, 13, 14}) {
+        if (kind == 2 && std::getenv("NANO_F16Q4_0")) continue;  // DBG tag: force Q4_0 via F16 upcast
         if (kind == 10 && std::getenv("NANO_F16Q2")) continue;  // DBG tag: force Q2_K via F16 upcast
         if (kind == 14 && std::getenv("NANO_F16Q6")) continue;  // DBG tag: force Q6_K via F16 upcast
         std::vector<uint8_t> qk;
          if (load_qk(name, kind, n_elements, qk)) { upload_qk_block(qk, kind, m); lt("qk"); return; }
     }
     std::vector<uint16_t> u; bool bf16 = false;
-    if (load_u16(name, u, bf16)) { upload_u16_block(u, m); m.bf16 = bf16; return; }
+    if (load_u16(name, u, bf16)) { upload_u16_block(u, m); m.bf16 = bf16; lt("u16"); return; }
     if (required) throw std::runtime_error("missing required weight: " + name);
 }
 void VulkanModel::load_matrix_host(const std::string& n, std::vector<uint16_t>& u16, bool& bf16,
@@ -300,7 +310,7 @@ void VulkanModel::load_matrix_host(const std::string& n, std::vector<uint16_t>& 
                                    int& qk_kind, size_t n_elements, bool required) {
     u16.clear(); q8.clear(); qk.clear(); bf16 = false; is_q8 = false; qk_kind = 0;
     if (load_q8(n, q8)) { is_q8 = true; return; }
-    for (int kind : {10, 12, 13, 14}) {
+    for (int kind : {2, 10, 12, 13, 14}) {
          if (load_qk(n, kind, n_elements, qk)) { qk_kind = kind; return; }
     }
     if (load_u16(n, u16, bf16)) { is_q8 = false; return; }
@@ -340,6 +350,8 @@ void VulkanModel::load_weights() {
         std::string p = model_prefix_ + "layers." + std::to_string(layer);
         bool has_attn = contains(p + ".self_attn.qkv_proj.weight") ||
                         contains(p + ".self_attn.q_proj.weight");
+        if (!has_attn && std::getenv("NANO_DEBUG"))
+            std::fprintf(stderr, "[T] layer %d has no attention weights (SSM-only? skipped)\n", layer);
         if (has_attn) {
         if (contains(p + ".self_attn.qkv_proj.weight")) {
             load_matrix(p + ".self_attn.qkv_proj.weight", lw.qkv, true, size_t(qkv_size_) * hidden);
@@ -356,11 +368,12 @@ void VulkanModel::load_weights() {
                 upload_q8_block(f, lw.qkv);
             } else if (qkind&&kkind&&vkind) {
                 size_t qe = size_t(q_size_)*hidden, ke = size_t(kv_size_)*hidden;
-                if (qe%256 || ke%256)
+                size_t qbe = qkind == 2 ? 32 : 256, kbe = kkind == 2 ? 32 : 256, vbe = vkind == 2 ? 32 : 256;
+                if (qe%qbe || ke%kbe || ke%vbe)
                     throw std::runtime_error("K-quant q/k/v split off super-block boundary");
-                size_t qb = qe/256*GGUFLoader::qk_block_bytes(qkind);
-                size_t kb = ke/256*GGUFLoader::qk_block_bytes(kkind);
-                size_t vb = ke/256*GGUFLoader::qk_block_bytes(vkind);
+                size_t qb = qe/(qkind == 2 ? 32 : 256)*GGUFLoader::qk_block_bytes(qkind);
+                size_t kb = ke/(kkind == 2 ? 32 : 256)*GGUFLoader::qk_block_bytes(kkind);
+                size_t vb = ke/(vkind == 2 ? 32 : 256)*GGUFLoader::qk_block_bytes(vkind);
                  std::vector<uint8_t> f; f.insert(f.end(),q_qk.begin(),q_qk.end());
                  f.insert(f.end(),k_qk.begin(),k_qk.end()); f.insert(f.end(),v_qk.begin(),v_qk.end());
                   upload_qk_block(f, qkind, lw.qkv);
@@ -498,6 +511,9 @@ void VulkanModel::load_weights() {
             }
         } else if (contains(p + ".mlp.gate_up_proj.weight")) {
             load_matrix(p + ".mlp.gate_up_proj.weight", lw.gate_up, true, size_t(2 * inter) * hidden);
+        } else if (size_t fe = fused_up_elems(p, inter, hidden); fe == size_t(2 * inter) * hidden) {
+            // Phi-3-style GGUF: gate+up stacked in ffn_up [2*inter, hidden].
+            load_matrix(p + ".mlp.up_proj.weight", lw.gate_up, true, fe);
         } else {
             std::vector<uint16_t> g_u,u_u; bool gbf=false,ubf=false;
             std::vector<uint8_t> g_q8,u_q8; bool gq=false,uq=false;
@@ -508,9 +524,9 @@ void VulkanModel::load_weights() {
                 std::vector<uint8_t> f; f.insert(f.end(),g_q8.begin(),g_q8.end()); f.insert(f.end(),u_q8.begin(),u_q8.end());
                 upload_q8_block(f, lw.gate_up);
             } else if (gkind&&ukind&&gkind==ukind) {
-                if ((size_t(inter)*hidden)%256)
+                if ((size_t(inter)*hidden)%(gkind == 2 ? 32 : 256))
                     throw std::runtime_error("K-quant gate/up split off super-block boundary");
-                size_t gb = size_t(inter)*hidden/256*GGUFLoader::qk_block_bytes(gkind);
+                size_t gb = size_t(inter)*hidden/(gkind == 2 ? 32 : 256)*GGUFLoader::qk_block_bytes(gkind);
                 std::vector<uint8_t> f; f.insert(f.end(),g_qk.begin(),g_qk.end()); f.insert(f.end(),u_qk.begin(),u_qk.end());
                 upload_qk_block(f, gkind, lw.gate_up);
                 lw.gate_up.qk_segs = {{gkind,0,0},{ukind,gb,size_t(inter)*hidden}};

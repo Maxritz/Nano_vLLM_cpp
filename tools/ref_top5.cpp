@@ -63,6 +63,7 @@ std::string ggmap(const std::string& n) {
   };
   rep("model.embed_tokens.weight", "token_embd.weight");
   rep(".self_attn.q_proj.weight", ".attn_q.weight");
+  rep(".self_attn.qkv_proj.weight", ".attn_qkv.weight");
   rep(".self_attn.k_proj.weight", ".attn_k.weight");
   rep(".self_attn.v_proj.weight", ".attn_v.weight");
   rep(".self_attn.q_proj.bias", ".attn_q.bias");
@@ -272,6 +273,11 @@ int main() {
   tok.set_fallback_vocab_size(hf.vocab_size);
   tok.load(config.model);
   std::vector<int> ids = tok.encode_text(prompt);
+  if (std::getenv("NANO_DEBUG")) {
+    std::fprintf(stderr, "[T] ref prompt ids:");
+    for (size_t k = 0; k < ids.size() && k < 32; ++k) std::fprintf(stderr, " %d", ids[k]);
+    std::fprintf(stderr, "\n");
+  }
   if (const char* ti = std::getenv("REF_TOKENS")) {
     ids.clear();
     for (const char* p = ti; *p;) { ids.push_back(atoi(p)); while (*p && *p != ',') ++p; if (*p == ',') ++p; }
@@ -341,10 +347,23 @@ int main() {
       for (int i = 0; i < hidden; ++i) resid[(size_t)t * hidden + i] += hidden_s[(size_t)t * hidden + i];
     rms_norm(resid, inln, T, hidden, eps, norm);
     std::vector<float> Wq, Wk, Wv, Wo, bq, bk, bv;
-    wl.mat(p + ".self_attn.q_proj.weight", (size_t)qs * hidden, Wq);
-    wl.mat(p + ".self_attn.k_proj.weight", (size_t)ks * hidden, Wk);
-    wl.mat(p + ".self_attn.v_proj.weight", (size_t)ks * hidden, Wv);
-    wl.mat(p + ".self_attn.o_proj.weight", (size_t)hidden * qs, Wo);
+    if (!wl.mat(p + ".self_attn.q_proj.weight", (size_t)qs * hidden, Wq)) {
+      // Fused qkv_proj [qs+2*ks, hidden] (e.g. Phi-3 GGUF): split host-side.
+      std::vector<float> fused;
+      size_t want = ((size_t)qs + 2 * (size_t)ks) * hidden;
+      if (!wl.mat(p + ".self_attn.qkv_proj.weight", want, fused) || fused.size() != want)
+        throw std::runtime_error("missing qkv for " + p);
+      Wq.assign(fused.begin(), fused.begin() + (size_t)qs * hidden);
+      Wk.assign(fused.begin() + (size_t)qs * hidden, fused.begin() + ((size_t)qs + ks) * hidden);
+      Wv.assign(fused.begin() + ((size_t)qs + ks) * hidden, fused.end());
+    } else {
+      if (!wl.mat(p + ".self_attn.k_proj.weight", (size_t)ks * hidden, Wk))
+        throw std::runtime_error("missing k for " + p);
+      if (!wl.mat(p + ".self_attn.v_proj.weight", (size_t)ks * hidden, Wv))
+        throw std::runtime_error("missing v for " + p);
+    }
+    if (!wl.mat(p + ".self_attn.o_proj.weight", (size_t)hidden * qs, Wo))
+      throw std::runtime_error("missing o for " + p);
     wl.vec(p + ".self_attn.q_proj.bias", bq);
     wl.vec(p + ".self_attn.k_proj.bias", bk);
     wl.vec(p + ".self_attn.v_proj.bias", bv);
@@ -533,9 +552,20 @@ int main() {
       }
     } else {
     std::vector<float> Wg, Wu, Wd;
-    wl.mat(p + ".mlp.gate_proj.weight", (size_t)inter * hidden, Wg);
-    wl.mat(p + ".mlp.up_proj.weight", (size_t)inter * hidden, Wu);
-    wl.mat(p + ".mlp.down_proj.weight", (size_t)hidden * inter, Wd);
+    if (!wl.mat(p + ".mlp.gate_proj.weight", (size_t)inter * hidden, Wg)) {
+      // Phi-3-style fused gate_up stacked in up_proj [2*inter, hidden].
+      std::vector<float> fused;
+      if (!wl.mat(p + ".mlp.up_proj.weight", (size_t)2 * inter * hidden, fused) ||
+          fused.size() != (size_t)2 * inter * hidden)
+        throw std::runtime_error("missing gate/up for " + p);
+      Wg.assign(fused.begin(), fused.begin() + (size_t)inter * hidden);
+      Wu.assign(fused.begin() + (size_t)inter * hidden, fused.end());
+    } else {
+      if (!wl.mat(p + ".mlp.up_proj.weight", (size_t)inter * hidden, Wu))
+        throw std::runtime_error("missing up for " + p);
+    }
+    if (!wl.mat(p + ".mlp.down_proj.weight", (size_t)hidden * inter, Wd))
+      throw std::runtime_error("missing down for " + p);
     for (int t = 0; t < T; ++t) {
       std::vector<float> x(hidden);
       memcpy(x.data(), &norm[(size_t)t * hidden], hidden * 4);

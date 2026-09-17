@@ -117,6 +117,9 @@ private:
     bool ready_ = false;
 
     void load_matrix(const std::string& name, VMatrix& m, bool required, size_t n_elements);
+    // Phi-3-style fused gate_up probe: element count of the up_proj tensor
+    // (0 when absent). Equals 2*inter*hidden only when gate+up are stacked.
+    size_t fused_up_elems(const std::string& layer_prefix, int inter, int hidden) const;
     void load_matrix_host(const std::string& name, std::vector<uint16_t>& u16, bool& bf16,
                           std::vector<uint8_t>& q8, bool& is_q8, std::vector<uint8_t>& qk,
                           int& qk_kind, size_t n_elements, bool required);

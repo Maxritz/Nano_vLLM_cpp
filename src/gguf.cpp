@@ -363,6 +363,7 @@ bool GGUFLoader::load_q8_0(const std::string& name, std::vector<uint8_t>& out) c
 
 size_t GGUFLoader::qk_block_bytes(int ggml_type) {
   switch (ggml_type) {
+    case 2: return 18;    // Q4_0
     case 10: return 84;   // Q2_K
     case 12: return 144;  // Q4_K
     case 13: return 176;  // Q5_K
@@ -593,7 +594,8 @@ bool GGUFLoader::load_upcast_f16(const std::string& name, std::vector<uint16_t>&
 bool GGUFLoader::load_qk(const std::string& name, int ggml_type, size_t n_elements,
                           std::vector<uint8_t>& out) const {
   size_t bb = qk_block_bytes(ggml_type);
-  if (!bb || n_elements % QK_K != 0) return false;
+  size_t be = (ggml_type == 2) ? 32 : (size_t)QK_K;  // Q4_0 blocks hold 32 values
+  if (!bb || n_elements % be != 0) return false;
   const GGUFTensorMeta* m = tensor(name);
   if (!m) return false;
   size_t n = 1;
@@ -601,7 +603,7 @@ bool GGUFLoader::load_qk(const std::string& name, int ggml_type, size_t n_elemen
   if (n != n_elements) return false;
   // Verify the on-disk dtype matches the requested kind (fail loud, never misread).
   if (m->dtype != ggml_type_name((uint32_t)ggml_type)) return false;
-  out.resize(n_elements / QK_K * bb);
+  out.resize(n_elements / be * bb);
   read_tensor_data(*m, out.data(), out.size());
   return true;
 }

@@ -31,7 +31,7 @@ struct GGUFTensorMeta {
 // One fused K-quant segment: raw super-blocks of a single kind. Fused qkv holds
 // three (q/k/v), fused gate_up two, single matrices one. Resolved by elem offset.
 struct QKSeg {
-  int kind = 0;            // ggml type id (12=Q4_K, 14=Q6_K)
+  int kind = 0;            // ggml type id (2=Q4_0, 10=Q2_K, 12=Q4_K, 13=Q5_K, 14=Q6_K)
   size_t byte_off = 0;     // byte offset of this segment in the fused stream
   size_t elem_off = 0;     // element offset of this segment
 };

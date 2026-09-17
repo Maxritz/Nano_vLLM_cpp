@@ -255,7 +255,18 @@ until the entire list below is green.
 - MiniCPM5-1B-Q6_K "Paris": GPU == CPU exact (5,49,24,1307,45050) AFTER fixing
   a real bug: the attn gate `if (qkv.f16||qkv.q8)` skipped attention entirely
   for native-K-quant qkv (uninitialized attn). One-line fix (+qk_segs); prior
-  goldens byte-identical after. Loader now traces `[T] load <name> via q8/qk`.
+  goldens byte-identical after. Loader now traces `[T] load <name> via q8/qk/u16`.
+- Phi-3-mini-4k "Paris": GPU == CPU EXACT (29966,529,29892,7081,5834) after a
+  5-fix arc: (1) fused gate_up in ffn_up [2*inter] (gguf_info probe built to
+  prove it); (2) --num-kv-blocks N (MHA-32 KV at 64 blocks = 12GB OOM);
+  (3) ref_top5 fused qkv/gate_up support + fail-loud throws (was segfaulting);
+  (4) embedding_qk.comp qk_q4 copy-paste bug (wrong qs index/nibble vs matmul
+  twin — every Q4_K-embed model was affected, none previously tested);
+  (5) map_name missing qkv_proj->attn_qkv rule (attention silently skipped
+  via has_attn=false; added [T] trace for skipped layers).
+- Q4_0 native kernel (qk_q4_0, kind 2, 32-elem blocks) wired through all 6
+  sites; no Q4_0 tensors on hand to prove it (Phi-3 is K-quants, not Q4_0).
+  NANO_F16Q4_0 escape hatch included.
 - tinyllama-q2k: GPU top5 == CPU ref top5 (8111,12126,4087,6492,23583)
 - attn_q Q2_K + attn_v Q4_K dequant == gguf-py canonical (sums + head values)
 - tokenizer ids == rebuilt-sentencepiece golden (all 13 ids exact)

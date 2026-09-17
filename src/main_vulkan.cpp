@@ -37,6 +37,7 @@ static void usage(const char* prog) {
   std::fprintf(stderr, "       [--rep-penalty THETA] [--rep-window W] [--system S]\n");
   std::fprintf(stderr, "       [--bench N] [--vram] [--rope-scale F] [--ctx-window N]\n");
   std::fprintf(stderr, "       [--prefill-chunk C]\n");
+  std::fprintf(stderr, "       [--num-kv-blocks N] (0 = auto; lower to fit big models)\n");
   std::fprintf(stderr, "       <model_dir> --server [host] [port]\n");
   std::fprintf(stderr, "  Sampling defaults come from generation_config.json when present;\n");
   std::fprintf(stderr, "  explicit flags always win. --rep-penalty divides the logits of ids\n");
@@ -251,6 +252,7 @@ int main(int argc, char** argv) {
     std::string prompt = "Hello";
     int max_tokens = 64;
     int max_model_len = 4096;
+    int num_kv_blocks = 0;  // 0 = auto estimate (64-block cap); set to fit big models
     bool server_mode = false;
     bool use_chat = false;
     bool use_repl = false;
@@ -286,6 +288,7 @@ int main(int argc, char** argv) {
       std::string a = argv[i];
       if (a == "--max-tokens" && i + 1 < argc) { max_tokens = std::atoi(argv[++i]); maxtok_set = true; }
       else if (a == "--max-model-len" && i + 1 < argc) { max_model_len = std::atoi(argv[++i]); mml_set = true; }
+      else if (a == "--num-kv-blocks" && i + 1 < argc) num_kv_blocks = std::atoi(argv[++i]);
       else if (a == "--chat") use_chat = true;
       else if (a == "--repl") use_repl = true;
       else if (a == "--system" && i + 1 < argc) system_prompt = argv[++i];
@@ -323,6 +326,7 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
     Config config;
     config.model = model_dir;
     config.max_model_len = max_model_len;
+    config.num_kvcache_blocks = num_kv_blocks;
     config.load_hf_config();
     // CTX-1: --rope-scale overrides rope_scaling{} from the config file.
     if (ropescale_set) {
@@ -590,6 +594,11 @@ else if (a == "--rep-penalty" && i + 1 < argc) { rep_penalty = std::atof(argv[++
     std::mt19937 rng(std::random_device{}());
 
     std::fprintf(stderr, "Prompt: \"%s\" -> %d tokens\n", prompt.c_str(), (int)ids.size());
+    if (getenv("NANO_DEBUG")) {
+      std::fprintf(stderr, "[T] prompt ids:");
+      for (size_t k = 0; k < ids.size() && k < 32; ++k) std::fprintf(stderr, " %d", ids[k]);
+      std::fprintf(stderr, "\n");
+    }
 
     int bsize = config.kvcache_block_size;
     int max_blocks = 64;

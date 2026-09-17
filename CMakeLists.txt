@@ -146,6 +146,11 @@ add_executable(kv_test test/kv_test.cpp)
 target_include_directories(kv_test PRIVATE include)
 add_executable(quant_test test/quant_test.cpp)
 target_include_directories(quant_test PRIVATE include)
+add_executable(gguf_info test/gguf_info.cpp src/gguf.cpp)
+target_include_directories(gguf_info PRIVATE include)
+target_compile_options(gguf_info PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/O2 /wd4100 /wd4101>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations>)
 # Self-tests assert(): keep them live in Release (which defines NDEBUG,
 # otherwise every *_TEST passes vacuously).
 foreach(t agent_test reason_test gen_test lora_test drafter_test cache_test spm_test rope_test prof_test kv_test quant_test rag_test samp_test)
