@@ -707,15 +707,17 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
         dev_->rms_norm_add(hidden_dev, residual_dev, lw.input_ln, norm_dev, rows, hidden, eps);
         // ATTN runs for any resident format (f16/upcast, q8, or native K-quant).
         if (lw.qkv.f16.buffer || lw.qkv.q8.buffer || !lw.qkv.qk_segs.empty()) {
-        dev_->matmul(norm_dev, lw.qkv, rows, q_size_, hidden, q_dev, 0u);
-        dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, k_dev, (uint32_t)(q_size_ * hidden));
+        // Independent q/k/v groups: skip the barrier on all but the last writer.
+        // The trailing barrier covers the whole group (global write->read).
+        dev_->matmul(norm_dev, lw.qkv, rows, q_size_, hidden, q_dev, 0u, false);
+        dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, k_dev, (uint32_t)(q_size_ * hidden), false);
         dev_->matmul(norm_dev, lw.qkv, rows, kv_size_, hidden, v_dev, (uint32_t)((q_size_ + kv_size_) * hidden));
         if (lw.qkv_bias.nbytes) {
-            dev_->add_bias_inplace(q_dev, lw.qkv_bias, rows, q_size_, 0u);
-            dev_->add_bias_inplace(k_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)q_size_);
+            dev_->add_bias_inplace(q_dev, lw.qkv_bias, rows, q_size_, 0u, false);
+            dev_->add_bias_inplace(k_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)q_size_, false);
             dev_->add_bias_inplace(v_dev, lw.qkv_bias, rows, kv_size_, (uint32_t)(q_size_ + kv_size_));
         }
-        if (lw.q_norm.nbytes) dev_->rms_norm(q_dev, lw.q_norm, q_dev, rows * heads, head_dim, eps);
+        if (lw.q_norm.nbytes) dev_->rms_norm(q_dev, lw.q_norm, q_dev, rows * heads, head_dim, eps, false);
         if (lw.k_norm.nbytes) dev_->rms_norm(k_dev, lw.k_norm, k_dev, rows * kv_heads, head_dim, eps);
         if (layer == 0) { pipe_tag("L0.q", q_dev, (size_t)rows * q_size_); pipe_tag("L0.k", k_dev, (size_t)rows * kv_size_); pipe_tag("L0.v", v_dev, (size_t)rows * kv_size_); }
         // CTX-1: pass YaRN scaling through to the rope shader; factor==1 is a
@@ -725,7 +727,7 @@ std::vector<float> VulkanModel::forward_logits(const VKContext& ctx) {    if (!r
             std::fprintf(stderr, "[T] rope L0 factor=%.3f beta=%.1f theta=%.1f\n", rf, rb, hf.rope_theta);
             std::fflush(stderr);
         }
-        dev_->rope(q_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_, rf, rb);
+        dev_->rope(q_dev, d_pos, inv_freq_, rows, heads, head_dim, q_size_, rf, rb, false);
         dev_->rope(k_dev, d_pos, inv_freq_, rows, kv_heads, head_dim, kv_size_, rf, rb);
         if (layer == 0) { pipe_tag("L0.qrope", q_dev, (size_t)rows * q_size_); pipe_tag("L0.krope", k_dev, (size_t)rows * kv_size_); }
         int d = kv_heads * head_dim;

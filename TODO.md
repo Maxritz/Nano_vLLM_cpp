@@ -247,6 +247,18 @@ until the entire list below is green.
       (DONE: include/nanovllm/profiles.hpp; default/chat/long/bench presets.
       PROF_TEST 3/3 pass. REMAINING: wire get()/names() into main_vulkan --profile.)
 
+## Speed work (Intel iGPU; qwen2.5-0.5b-q2_k, 20 tok, bench 3)
+- Baseline: 4.96 tok/s decode / 21.2 tok/s prompt.
+- Validation opt-in: 5.8 (+17%). Barrier elision (q/k/v+bias+norm+rope groups): 6.05.
+- Total banked: 4.96 -> 6.05 tok/s (+22%), prompt 21.2 -> 29.7. Golden-locked.
+- Tried and cut: GEMV decode kernels (bit-exact, zero gain — bottleneck is drain
+  bubbles, not ALU waste). High-perf power plan: no gain (restored Balanced).
+- Measured anatomy (NANO_TIME): ~130ms fence + ~12ms download per token;
+  ~172ms fixed per forward + ~8ms/row. Per-dispatch ~0.5ms fully-drained.
+- Next levers (structural): qkv 3->1 dispatch fusion (needs qkv_dev layout
+  ripple through rope/store/bias); prologue fusion (norm+matmul); GPU sampler
+  loop. NOT next: overlap (saves ~10ms, fence is the work), power plan (nil).
+
 ## Benchmarks (Intel iGPU, --bench 3, 20 tokens; coherent sample verified)
 - qwen2.5-0.5b-q2_k: "The capital of France is" -> "Paris. It is located in
   the center of the country... country's largest city, and the seat of the

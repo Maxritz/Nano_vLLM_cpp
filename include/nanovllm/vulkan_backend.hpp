@@ -95,17 +95,17 @@ class VulkanBackend {
   // Recorded ops (append to cmd_; each calls dispatch() which barrier's). Buffer
   // sub-ranges (row/col offsets) are passed as byte-element offsets so per-layer KV
   // slices and qkv_row splits work without shader changes (Vulkan descriptor offsets).
-  void matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off = 0);
-  void matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off = 0, uint32_t ws_off = 0);
-  void matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off = 0);
-  void matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off = 0); // qk/q8/f16 dispatch
-  void rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps);
+  void matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off = 0, bool barrier_after = true);
+  void matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off = 0, uint32_t ws_off = 0, bool barrier_after = true);
+  void matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off = 0, bool barrier_after = true);
+  void matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off = 0, bool barrier_after = true); // qk/q8/f16 dispatch
+  void rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after = true);
   void rms_norm_add(VBuf& x, VBuf& residual, VBuf& w, VBuf& y, int rows, int hidden, float eps);
-  void add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off = 0);
+  void add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off = 0, bool barrier_after = true);
    void silu_and_mul(VBuf& gup, VBuf& y, int rows, int inter);
    void scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols);
   void rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride,
-          float rope_factor = 1.0f, float rope_beta = 32.0f);
+          float rope_factor = 1.0f, float rope_beta = 32.0f, bool barrier_after = true);
   void store_kv(VBuf& key, VBuf& value, VBuf& k_cache, VBuf& v_cache, VBuf& slot_map,
                 int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off = 0, VkDeviceSize v_off = 0);
    void paged_attention(VBuf& q, VBuf& y, VBuf& k_cache, VBuf& v_cache, VBuf& qseq, VBuf& qlen,
@@ -172,8 +172,13 @@ class VulkanBackend {
   void storage_barrier();
   void dispatch(const char* name, const void* pc, size_t pc_size,
                 const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
+  // Same, but skips the trailing storage barrier. Only for runs of independent
+  // dispatches (disjoint outputs); the last one must barrier (or use dispatch).
+  void dispatch_nb(const char* name, const void* pc, size_t pc_size,
+                   const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
   void dispatch_bound(VkPipeline p, const void* pc, size_t pc_size,
-                      const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz);
+                      const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz,
+                      bool barrier = true);
   VkInstance inst_;
   VkPhysicalDevice pd_;
   VkPhysicalDeviceProperties props_;

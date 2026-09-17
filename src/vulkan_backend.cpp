@@ -371,8 +371,9 @@ void VulkanBackend::ensure_pipeline_spec(const char* spv_name, const char* key,
 }
 
 void VulkanBackend::dispatch_bound(VkPipeline p,
-                                  const void* pc, size_t pc_size,
-                                  const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz) {
+                                   const void* pc, size_t pc_size,
+                                   const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz,
+                                   bool barrier) {
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     VkDescriptorBufferInfo infos[8];
     VkWriteDescriptorSet writes[8];
@@ -387,7 +388,7 @@ void VulkanBackend::dispatch_bound(VkPipeline p,
     push_fn_(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout_, 0, (uint32_t)nbufs, writes);
     if (pc && pc_size) vkCmdPushConstants(cmd_, pipe_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size, pc);
     vkCmdDispatch(cmd_, gx, gy, gz);
-    if (!std::getenv("NANO_NO_BARRIER")) storage_barrier();
+    if (barrier) storage_barrier();
 }
 
 void VulkanBackend::begin_if_needed() {
@@ -410,6 +411,12 @@ void VulkanBackend::dispatch(const char* name, const void* pc, size_t pc_size,
                              const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz) {
     begin_if_needed();
     dispatch_bound(get_pipe(name), pc, pc_size, bufs, nbufs, gx, gy, gz);
+}
+
+void VulkanBackend::dispatch_nb(const char* name, const void* pc, size_t pc_size,
+                                 const BufBind* bufs, size_t nbufs, uint32_t gx, uint32_t gy, uint32_t gz) {
+    begin_if_needed();
+    dispatch_bound(get_pipe(name), pc, pc_size, bufs, nbufs, gx, gy, gz, false);
 }
 
 void VulkanBackend::dispatch_spec(const char* spv_name, const char* key,
@@ -593,21 +600,23 @@ std::unique_ptr<VulkanBackend> VulkanBackend::Create(bool force_device_local) {
 }
 
 // ── op dispatchers (bit-exact mirrors of hip_ops.hip; GLSL math matches) ─────
-void VulkanBackend::matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off) {
+void VulkanBackend::matmul(VBuf& x, VBuf& w, int m, int n, int k, VBuf& y, bool bf16, uint32_t w_off, bool barrier_after) {
     if (m <= 0 || n <= 0 || k <= 0) return;
     struct PC { int m, n, k; int bf16; uint32_t w_off; } pc{ m, n, k, bf16 ? 1 : 0, w_off };
     VkDeviceSize wbyte = (VkDeviceSize)w_off * 2;
     BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, w.buffer, wbyte, 0}, {2, y.buffer, 0, 0} };
-    dispatch("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
+    if (barrier_after) dispatch("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
+    else dispatch_nb("matmul", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
 }
-void VulkanBackend::matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off, uint32_t ws_off) {
+void VulkanBackend::matmul_q8(VBuf& x, VBuf& w8, VBuf& ws, int m, int n, int k, VBuf& y, uint32_t w_off, uint32_t ws_off, bool barrier_after) {
     if (m <= 0 || n <= 0 || k <= 0) return;
     struct PC { int m, n, k; uint32_t w_off; uint32_t ws_off; } pc{ m, n, k, w_off, ws_off };
     BufBind bufs[4] = { {0, x.buffer, 0, 0}, {1, w8.buffer, (VkDeviceSize)w_off, 0},
                         {2, ws.buffer, (VkDeviceSize)ws_off * 2, 0}, {3, y.buffer, 0, 0} };
-    dispatch("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
+    if (barrier_after) dispatch("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
+    else dispatch_nb("matmul_q8", &pc, sizeof(pc), bufs, 4, ru(n,16)/16, ru(m,16)/16, 1);
 }
-void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off) {
+void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, uint32_t w_off, bool barrier_after) {
     if (!w.qk_segs.empty()) {
         const QKSeg* seg = &w.qk_segs[0];
         for (auto& s : w.qk_segs)
@@ -618,31 +627,34 @@ void VulkanBackend::matmul(VBuf& x, VMatrix& w, int m, int n, int k, VBuf& y, ui
             std::fprintf(stderr, "VK: K-quant row split off super-block boundary\n"); std::exit(1);
         }
         VkDeviceSize wbyte = (VkDeviceSize)(seg->byte_off + (w_off - (uint32_t)seg->elem_off) / be * bb);
-        matmul_qk(x, w.qk, m, n, k, y, seg->kind, wbyte);
-    } else if (w.is_q8) matmul_q8(x, w.q8, w.qsc, m, n, k, y, w_off, w_off / 32);
-    else matmul(x, w.f16, m, n, k, y, w.bf16, w_off);
+        matmul_qk(x, w.qk, m, n, k, y, seg->kind, wbyte, barrier_after);
+    } else if (w.is_q8) matmul_q8(x, w.q8, w.qsc, m, n, k, y, w_off, w_off / 32, barrier_after);
+    else matmul(x, w.f16, m, n, k, y, w.bf16, w_off, barrier_after);
 }
-void VulkanBackend::matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off) {
+void VulkanBackend::matmul_qk(VBuf& x, VBuf& wq, int m, int n, int k, VBuf& y, int kind, VkDeviceSize wbyte_off, bool barrier_after) {
     if (m <= 0 || n <= 0 || k <= 0) return;
     struct PC { int m, n, k; int kind; uint32_t woff; } pc{ m, n, k, kind, (uint32_t)wbyte_off };
     BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, wq.buffer, 0, 0}, {2, y.buffer, 0, 0} };
-    dispatch("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
+    if (barrier_after) dispatch("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
+    else dispatch_nb("matmul_qk", &pc, sizeof(pc), bufs, 3, ru(n,16)/16, ru(m,16)/16, 1);
 }
-void VulkanBackend::rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps) {
+void VulkanBackend::rms_norm(VBuf& x, VBuf& w, VBuf& y, int rows, int hidden, float eps, bool barrier_after) {
     struct PC { int rows, hidden; float eps; } pc{ rows, hidden, eps };
     BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, w.buffer, 0, 0}, {2, y.buffer, 0, 0} };
-    dispatch("rms_norm", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
+    if (barrier_after) dispatch("rms_norm", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
+    else dispatch_nb("rms_norm", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
 }
 void VulkanBackend::rms_norm_add(VBuf& x, VBuf& residual, VBuf& w, VBuf& y, int rows, int hidden, float eps) {
     struct PC { int rows, hidden; float eps; } pc{ rows, hidden, eps };
     BufBind bufs[4] = { {0, x.buffer, 0, 0}, {1, residual.buffer, 0, 0}, {2, w.buffer, 0, 0}, {3, y.buffer, 0, 0} };
     dispatch("rms_norm_add", &pc, sizeof(pc), bufs, 4, rows, 1, 1);
 }
-void VulkanBackend::add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off) {
+void VulkanBackend::add_bias_inplace(VBuf& x, VBuf& bias, int rows, int cols, uint32_t row_off, bool barrier_after) {
     struct PC { int rows, cols; } pc{ rows, cols };
     VkDeviceSize ob = (VkDeviceSize)row_off * sizeof(float);
     BufBind bufs[3] = { {0, x.buffer, 0, 0}, {1, bias.buffer, ob, 0}, {2, x.buffer, 0, 0} };
-    dispatch("add_bias", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
+    if (barrier_after) dispatch("add_bias", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
+    else dispatch_nb("add_bias", &pc, sizeof(pc), bufs, 3, rows, 1, 1);
 }
 void VulkanBackend::silu_and_mul(VBuf& gup, VBuf& y, int rows, int inter) {
     struct PC { int rows, inter; } pc{ rows, inter };
@@ -656,11 +668,12 @@ void VulkanBackend::scale_sigmoid(VBuf& x, VBuf& s, int rows, int cols) {
     dispatch("scale_sigmoid", &pc, sizeof(pc), bufs, 2, rows, 1, 1);
 }
 void VulkanBackend::rope(VBuf& data, VBuf& pos, VBuf& inv_freq, int tokens, int heads, int head_dim, int64_t stride,
-                         float rope_factor, float rope_beta) {
+                         float rope_factor, float rope_beta, bool barrier_after) {
     int total = tokens * heads * (head_dim/2); if (total <= 0) return;
     struct PC { int tokens, heads, head_dim; int64_t stride; float rope_factor; float rope_beta; float rope_theta; } pc{ tokens, heads, head_dim, stride, rope_factor, rope_beta, 0.0f };
     BufBind bufs[3] = { {0, data.buffer, 0, 0}, {1, pos.buffer, 0, 0}, {2, inv_freq.buffer, 0, 0} };
-    dispatch("rope", &pc, sizeof(pc), bufs, 3, ru(total,256)/256, 1, 1);
+    if (barrier_after) dispatch("rope", &pc, sizeof(pc), bufs, 3, ru(total,256)/256, 1, 1);
+    else dispatch_nb("rope", &pc, sizeof(pc), bufs, 3, ru(total,256)/256, 1, 1);
 }
 void VulkanBackend::store_kv(VBuf& key, VBuf& val, VBuf& k_cache, VBuf& v_cache, VBuf& slot_map,
                              int kv_heads, int head_dim, int total_tokens, VkDeviceSize k_off, VkDeviceSize v_off) {
