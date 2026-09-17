@@ -263,6 +263,67 @@ until the entire list below is green.
   ripple through rope/store/bias); prologue fusion (norm+matmul); GPU sampler
   loop. NOT next: overlap (saves ~10ms, fence is the work), power plan (nil).
 
+## Decode GEMV rewrite (2026-09; commit ea30523) — PICK UP HERE
+Ground truth established by building llama.cpp on this same laptop
+(C:/Users/rina0423/Desktop/Ultrallama, builds build_cpu + build_vk):
+  llama.cpp CPU    23.6 t/s decode, 105.9 t/s prompt  (14 threads)
+  llama.cpp Vulkan 53.4 t/s decode, 162.6 t/s prompt  (SAME Intel iGPU)
+  my nanovllm       12.4 t/s decode,  ~54 t/s prompt
+=> the ~4x gap is KERNEL QUALITY, not hardware. This iGPU has NO
+VK_KHR_cooperative_matrix (vulkaninfo confirmed); llama.cpp reaches 53 t/s
+with subgroup ops + coalescing + packed loads alone. The earlier
+"24.5 GB/s UMA ceiling caps a 2B model at ~20 t/s" reasoning was WRONG
+(53 t/s x 390 MiB ~= 21 GB/s, i.e. the reference sits at ~85% of that
+ceiling while my kernels extracted ~16%). Do not re-derive limits from the
+bw_probe number without cross-checking against llama.cpp.
+
+Progress this session (all interleaved A/B/A/B/A measurement, see below):
+  - 7.59 baseline (tiled 16x16 matmul_q8)
+  - 11.92 scalar per-column GEMV (16 cols x 4 K-lanes, one uint8 stream/lane)
+  - 12.41 cooperative tiled GEMV (committed) — 16 lanes read one 32-byte Q8_0
+    block as consecutive uint16s (coalesced), 16 blocks in flight per WG
+    (256 threads), register accumulators, single subgroupAdd+shared reduce.
+  Ranges do not overlap vs scalar on interleaved pairs.
+
+REMAINING LEVERS, in expected-value order:
+  1. Port the cooperative tiling to the K-quant GEMV (matmul_qk_gemv.comp).
+     qwen2.5-0.5b's q/k/v are Q2_K -> the K-quant path is the MAJORITY of
+     decode weight traffic and it still uses the old per-column layout.
+     Reference: llama.cpp ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q2_k.comp
+     (16 threads per 256-element superblock, sccache scale cache shared
+     across output columns, [[unroll]] FMA chains, temp[j][n] register tiles).
+  2. f16 matmul (attn_output, ffn_down) still routes to the 16x16 tile at
+     decode — 144 dispatches/token, n=896 so the current GEMV gate
+     (ru(n,16)/16 >= 128) excludes it. Either lower the gate for the tiled
+     kernel or give f16 the same cooperative treatment.
+  3. 388 dispatches/token (NANO_DISPATCH table: 144 matmul, 72 add_bias,
+     49 rms_norm_add, 48 rope, 24 each paged_attention/silu_and_mul/store_kv).
+     Per-dispatch cost scales with work, not fixed (tinyllama 0.09ms vs
+     qwen  0.34ms), so fusion is the lever only AFTER the matmuls are fast.
+  4. x vector is re-read per output column; reference caches it. Minor for
+     Q8 (weights dominate) but matters once weights are fast.
+
+METHODOLOGY (must keep): sequential 5-run batches are THERMALLY CONFOUNDED
+on this laptop — medians drifted 10.35 -> 6.82 with zero code change. All
+perf comparisons must interleave configs (A/B/A/B/A over 5-10 rounds). The
+"packed loads are 26% slower" and "GEMV is a wash" conclusions from earlier
+were both thermal artifacts, disproved by interleaving.
+
+Bugs found + fixed while validating (golden top-5 diff catches everything):
+  - Q8_0 upload strips the fp16 scale header: w8 stride is 32 not 34, scales
+    live in a separate ws buffer (one fp16 per block per column, indexed by
+    GLOBAL block number col*nb_total+b).
+  - weight is [n][k] row-major: column c owns blocks [c*nb_total, ...);
+    indexing blocks from 0 ignores col and makes every column identical
+    (telltale: all logits exactly equal).
+  - tiled GEMV needs n workgroups (one per output column), not ru(n,16)/16.
+  - 'break' inside a cooperative loop diverges lanes -> corrupts coalesced
+    loads AND subgroupAdd. Use an if-guard, never break.
+  - early return before reduction barriers deadlocks the workgroup.
+  - sign handling: Q8 bytes are two's-complement int8, NOT biased; for
+    unsigned u, q = u - 256*[u>=128], so sum(x*q) = sum(x*u) - 256*sum_{u>=128}(x).
+
+
 ## Benchmarks (Intel iGPU, --bench 3, 20 tokens; coherent sample verified)
 - qwen2.5-0.5b-q2_k: "The capital of France is" -> "Paris. It is located in
   the center of the country... country's largest city, and the seat of the
